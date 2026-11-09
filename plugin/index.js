@@ -22,7 +22,10 @@ import {
   readFileSync, readdirSync, writeFileSync, unlinkSync, existsSync, mkdirSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
-import { homedir } from 'node:os';
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import { homedir, hostname } from 'node:os';
 import { join, dirname } from 'node:path';
 
 const API_PREFIX = '/lifehud/api';
@@ -87,6 +90,27 @@ const DEFAULT_BOUNDS = { morningStart: 6, noonStart: 13, eveningStart: 18 };
 const SLOT_LABEL = { morning: '早', noon: '午', evening: '晚', rest: '休息' };
 const WEATHER_TTL_MS = 10 * 60 * 1000;
 const ACTIVITY_TTL_MS = 10 * 60 * 1000;
+
+/* ---- 自采集（前台窗口 + AFK）常量，见下面「自采集」一节 ---- */
+/** 本地采集库文件名：`<dataDir>/capture.db`（`config.captureDb` 可整段覆盖）。 */
+const CAPTURE_FILE = 'capture.db';
+/** 采样间隔（秒）。2 秒接近 AW 的 1 秒粒度，又不会把库写胖。 */
+const CAPTURE_POLL_SECONDS_DEFAULT = 2;
+/** 空闲超过这么多秒算「离开」。 */
+const AFK_THRESHOLD_DEFAULT = 180;
+/** 同一事件内允许的最大心跳间隔，超过就当新事件（对齐 AW 的 pulsetime）。 */
+const CAPTURE_PULSETIME_MIN_SECONDS = 10;
+/** 攒够这么多事件、或者等这么久，就落盘一次（批量写，少抖动）。 */
+const CAPTURE_FLUSH_ROWS = 50;
+const CAPTURE_FLUSH_MS = 60 * 1000;
+/** 采集器意外退出后的重启上限（指数退避，到顶就停并写诊断）。 */
+const CAPTURE_RESTART_MAX = 5;
+/** 诊断区最多保留这么多条采集相关 warning。 */
+const CAPTURE_WARNING_MAX = 20;
+/** 采集库的表结构版本（规格 §4.3）。 */
+const CAPTURE_SCHEMA_VERSION = '2';
+/** 本插件自采集的 bucket 归属者，迁移来的数据仍是 'aw-watcher-window' 等原值。 */
+const CAPTURE_CLIENT = 'lifehud-capture';
 // 体重只在踩秤后变化，10 分钟一次足够；手动刷新会用 ?force=1 跳过这个 TTL。
 const WEIGHT_TTL_MS = 10 * 60 * 1000;
 const MAX_PHOTO_BYTES = 4 * 1024 * 1024;
@@ -549,6 +573,445 @@ async function readActivity(base, aliases = {}) {
   const value = await fetchActivity(base, aliases);
   activityCache = { at: Date.now(), value };
   return value;
+}
+
+/* ------------------------------------------------- 自采集（前台窗口 + AFK） */
+
+/**
+ * 专注卡的数据从 v1.1.1 起是自己采的，不再依赖 ActivityWatch 进程：
+ *
+ *   Windows user32/kernel32
+ *      ↑ P/Invoke（C#，靠 Windows 自带的 PowerShell 5.1 在内存里编译，零安装）
+ *   plugin/collector.ps1         长驻子进程，每 N 秒输出一行 JSON
+ *      ↓ stdout（JSONL，UTF-8 —— 脚本开头把 OutputEncoding 设成 UTF-8，否则中文乱码）
+ *   startCollector()             readline 逐行收流
+ *      ↓ appendSample()          同 bucket + 同 data + 间隔 ≤ pulsetime 就延长未闭合事件
+ *   <dataDir>/capture.db         node:sqlite（LifeHud 唯一可写的地方）
+ *      ↓ readOwnActivity()
+ *   buildHud() 的 focus / heatmap → GET /lifehud/api/hud（对外契约不变）
+ *
+ * 采集（写）与展示（读）解耦：页面请求只读本地库，不触发采集、不联网。
+ */
+
+/**
+ * 采集库建表语句（规格 §4.3 的通用模型：bucket + 原始 JSON 事件）。
+ * `events.data` 存**原始 JSON 原文**，将来加新 watcher（键鼠计数 / 浏览器 URL …）
+ * 直接塞进来就行，不用改库；`source` 区分实时采集与迁移来的历史。
+ */
+const CAPTURE_SCHEMA = `
+CREATE TABLE IF NOT EXISTS buckets (
+  id       TEXT PRIMARY KEY,
+  type     TEXT NOT NULL,
+  client   TEXT NOT NULL,
+  hostname TEXT NOT NULL,
+  created  TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS events (
+  id        INTEGER PRIMARY KEY,
+  bucket_id TEXT    NOT NULL REFERENCES buckets(id),
+  ts        TEXT    NOT NULL,
+  duration  REAL    NOT NULL,
+  data      TEXT    NOT NULL,
+  source    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_events_bucket_ts ON events(bucket_id, ts);
+CREATE INDEX IF NOT EXISTS idx_events_ts        ON events(ts);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+`;
+
+/** 采集运行时（模块级单例：HMR / 重装可能让 apply 跑两次，绝不能起两个采集器）。 */
+let captureRuntime = null;
+
+/** 采集器的诊断信息（buildHud 时附加到 warnings，页面诊断区才看得见）。 */
+const captureWarnings = [];
+
+/**
+ * 记一条采集相关诊断：去重 + 封顶，避免刷屏。
+ * @param {string} message @returns {void}
+ */
+function noteCapture(message) {
+  const text = String(message ?? '').trim().replace(/\s+/g, ' ');
+  if (!text) return;
+  const line = `capture: ${text}`;
+  if (captureWarnings.includes(line)) return;
+  captureWarnings.push(line);
+  if (captureWarnings.length > CAPTURE_WARNING_MAX) captureWarnings.shift();
+}
+
+/**
+ * capture.db 的位置：默认 `<dataDir>/capture.db`，可用 `config.captureDb` 整段覆盖。
+ * @param {object} [config] bundle row config
+ * @returns {string} path
+ */
+function captureDbPath(config = {}) {
+  const explicit = String(config.captureDb ?? '');
+  if (explicit) return explicit;
+  const dataDir = String(config.dataDir ?? '') || join(homedir(), '.dsh', 'lifehud');
+  return join(dataDir, CAPTURE_FILE);
+}
+
+/**
+ * 打开（必要时新建）capture.db —— **非只读**，这是 LifeHud 唯一自己写的库。
+ * 建表是幂等的，所以每次启动都可以放心调用。
+ * @param {string} dbPath 库路径
+ * @returns {import('node:sqlite').DatabaseSync} handle
+ */
+export function openCaptureDb(dbPath) {
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  db.exec(CAPTURE_SCHEMA);
+  db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run('schema_version', CAPTURE_SCHEMA_VERSION);
+  db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run('hostname', hostname());
+  return db;
+}
+
+/**
+ * 保证某个 bucket 行存在（events 有外键，先有 bucket 才有事件）。
+ * @param {object} db @param {string} id @param {string} type @param {string} host @returns {void}
+ */
+function ensureCaptureBucket(db, id, type, host) {
+  db.prepare('INSERT OR IGNORE INTO buckets (id, type, client, hostname, created) VALUES (?, ?, ?, ?, ?)')
+    .run(id, type, CAPTURE_CLIENT, host, new Date().toISOString());
+}
+
+/**
+ * 未闭合事件 → 待写行。
+ * @param {object} segment @returns {{rowId:number|null,bucketId:string,ts:string,duration:number,data:string}}
+ */
+function settleSegment(segment) {
+  return {
+    rowId: segment.rowId,
+    bucketId: segment.bucketId,
+    ts: new Date(segment.startMs).toISOString(),
+    duration: Math.max(0, (segment.endMs - segment.startMs) / 1000),
+    data: segment.data,
+  };
+}
+
+/**
+ * 收一条采集样本（采集器每 N 秒一行）。
+ *
+ * 一行样本拆成两条流：窗口（app + title）与 AFK（status）；两条流各自维护一条
+ * 未闭合事件，同 data 且间隔 ≤ pulsetime 就延长，否则闭合旧的、开新的。
+ * @param {object} row `{timestamp, app, title, idle_seconds, status}`
+ * @returns {void}
+ */
+export function appendSample(row) {
+  const state = captureRuntime;
+  if (!state?.db) return;
+  const tsMs = Date.parse(String(row?.timestamp ?? ''));
+  if (!Number.isFinite(tsMs)) return;
+
+  state.samples += 1;
+  state.lastSampleAt = tsMs;
+
+  const app = String(row?.app ?? '') || 'unknown';
+  // 窗口标题可能很敏感：storeTitles:false 时只留应用名（决策 D3）。
+  const title = state.storeTitles ? String(row?.title ?? '') : '';
+  const status = String(row?.status ?? '') === 'afk' ? 'afk' : 'not-afk';
+
+  const openedWindow = pushSegment(state, state.windowBucket, JSON.stringify({ app, title }), tsMs);
+  const openedAfk = pushSegment(state, state.afkBucket, JSON.stringify({ status }), tsMs);
+
+  // 事件切换（开/闭一段）就立刻落盘：这样第一个样本到来后库里马上有行，
+  // 「刚切到新应用」也不用等下一个 60 秒。同一应用连续不变时只靠 flush 定时器
+  // 更新 duration，写入次数可以忽略。
+  if (openedWindow || openedAfk || state.pending.length >= CAPTURE_FLUSH_ROWS) flushCapture(state);
+}
+
+/**
+ * 把一条样本并进某条流的未闭合事件。
+ * @param {object} state 运行时 @param {string} bucketId @param {string} data 原始 JSON
+ * @param {number} tsMs 样本时间
+ * @returns {boolean} 是否新开了一段（新开 = 需要马上落盘）
+ */
+function pushSegment(state, bucketId, data, tsMs) {
+  const open = state.open.get(bucketId);
+  // 时间倒退的样本（时钟回拨 / 乱序）一律当新事件，别把旧时长撑坏。
+  if (open && open.data === data && tsMs >= open.endMs && tsMs - open.endMs <= state.pulsetimeMs) {
+    open.endMs = tsMs;
+    return false;
+  }
+  if (open) {
+    state.pending.push(settleSegment(open));
+    state.open.delete(bucketId);
+  }
+  state.open.set(bucketId, { rowId: null, bucketId, data, startMs: tsMs, endMs: tsMs });
+  return true;
+}
+
+/**
+ * 落盘。
+ *
+ * 未闭合事件也一起写：先 INSERT 拿到 rowid，之后每次 flush 原地 UPDATE duration。
+ * 这样「同一个应用连续 8 小时」库里只有一行，而页面上又能看到实时增长的时长
+ * —— 否则事件不切换就永远不落盘，专注卡会一直看着是空的。
+ * @param {object|null} [state] 运行时，默认当前单例
+ * @returns {number} 本轮落盘的事件数（含 UPDATE，够诊断用）
+ */
+function flushCapture(state = captureRuntime) {
+  if (!state?.db) return 0;
+  const closed = state.pending.splice(0, state.pending.length);
+  const open = [...state.open.values()];
+  if (closed.length === 0 && open.length === 0) return 0;
+
+  let written = 0;
+  try {
+    state.db.exec('BEGIN');
+    for (const row of closed) {
+      if (row.rowId == null) {
+        state.insertStmt.run(row.bucketId, row.ts, row.duration, row.data, 'live');
+      } else {
+        state.updateStmt.run(row.duration, row.rowId);
+      }
+      written += 1;
+    }
+    for (const segment of open) {
+      const row = settleSegment(segment);
+      if (row.rowId == null) {
+        const result = state.insertStmt.run(row.bucketId, row.ts, row.duration, row.data, 'live');
+        segment.rowId = Number(result.lastInsertRowid);
+      } else {
+        state.updateStmt.run(row.duration, row.rowId);
+      }
+      written += 1;
+    }
+    state.db.exec('COMMIT');
+    state.rows += written;
+    state.lastFlushAt = Date.now();
+    return written;
+  } catch (error) {
+    try { state.db.exec('ROLLBACK'); } catch { /* 事务可能已经不在了 */ }
+    // 没写成功的闭合事件放回队列，下一轮再试，别默默丢掉数据。
+    if (closed.length > 0) state.pending.unshift(...closed);
+    state.lastError = error instanceof Error ? error.message : String(error);
+    noteCapture(`写库失败：${state.lastError}`);
+    return 0;
+  }
+}
+
+/** `process.on('exit')` 兜底只注册一次。 */
+let captureExitHookInstalled = false;
+
+/** 兜底：无论怎么退出，都别把 powershell 采集进程留在后台。 */
+function installCaptureExitHook() {
+  if (captureExitHookInstalled) return;
+  captureExitHookInstalled = true;
+  process.on('exit', () => {
+    try { captureRuntime?.child?.kill(); } catch { /* 进程已经没了 */ }
+  });
+}
+
+/**
+ * 启动（或重启）采集器子进程。
+ * @param {object} state 运行时 @returns {void}
+ */
+function spawnCaptureChild(state) {
+  // 不依赖 PATH（也不点名 pwsh，Windows 自带的是 5.1 版 powershell.exe）；
+  // 目录同样来自环境变量，仓库里不出现任何绝对路径。
+  const winDir = process.env.WINDIR || process.env.SystemRoot || '';
+  if (!winDir) {
+    noteCapture('找不到 %WINDIR%，无法启动采集器');
+    return;
+  }
+
+  let script;
+  try {
+    script = fileURLToPath(new URL('./collector.ps1', import.meta.url));
+  } catch (error) {
+    noteCapture(`定位 collector.ps1 失败：${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  if (!existsSync(script)) {
+    noteCapture('collector.ps1 不存在（插件包缺文件？）');
+    return;
+  }
+
+  let child;
+  try {
+    child = spawn(join(winDir, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'), [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script,
+      '-PollSeconds', String(state.pollSeconds), '-AfkThreshold', String(state.afkThreshold),
+    ], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    noteCapture(`启动采集器失败：${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+
+  state.child = child;
+  state.pid = child.pid ?? null;
+
+  const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
+  state.rl = rl;
+  rl.on('line', (line) => {
+    const text = String(line ?? '').trim();
+    if (!text) return;
+    try {
+      appendSample(JSON.parse(text));
+    } catch {
+      // 采集器偶尔输出杂音（例如 Warning 流被合并进来），不当错误。
+      state.noise = (state.noise ?? 0) + 1;
+    }
+  });
+
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr = (stderr + String(chunk)).slice(-2000);
+  });
+
+  child.on('error', (error) => {
+    noteCapture(`采集器进程错误：${error instanceof Error ? error.message : String(error)}`);
+  });
+
+  child.on('exit', (code, signal) => {
+    if (state.rl === rl) {
+      try { rl.close(); } catch { /* 已关闭 */ }
+      state.rl = null;
+    }
+    if (state.child === child) state.child = null;
+    if (state.stopping) return;
+    const detail = stderr.trim() || (signal ? `signal ${signal}` : `exit code ${code}`);
+    state.lastError = detail;
+    noteCapture(`采集器退出（${code ?? signal}）：${detail}`);
+    scheduleCaptureRestart(state);
+  });
+}
+
+/**
+ * 采集器崩了就按指数退避重启，最多 CAPTURE_RESTART_MAX 次；到顶就停并写诊断，
+ * 让用户至少能在诊断区看到「为什么没有数据」。
+ * @param {object} state 运行时 @returns {void}
+ */
+function scheduleCaptureRestart(state) {
+  if (state.stopping || captureRuntime !== state) return;
+  if (state.restarts >= CAPTURE_RESTART_MAX) {
+    noteCapture(`采集器已连续重启 ${state.restarts} 次，停止尝试（专注卡可能没有新数据）`);
+    return;
+  }
+  const delay = Math.min(30000, 500 * 2 ** state.restarts);
+  state.restarts += 1;
+  const timer = setTimeout(() => {
+    state.restartTimer = null;
+    if (state.stopping || captureRuntime !== state) return;
+    spawnCaptureChild(state);
+  }, delay);
+  if (typeof timer.unref === 'function') timer.unref();
+  state.restartTimer = timer;
+}
+
+/**
+ * 启动采集（单例）。
+ * @param {object} [config] bundle row config
+ * @returns {() => void} disposer：kill 子进程 → flush → 关库
+ */
+export function startCollector(config = {}) {
+  if (captureRuntime) {
+    noteCapture('采集器已在运行，忽略重复启动');
+    return () => {};
+  }
+
+  const dbPath = captureDbPath(config);
+  const pollSeconds = Math.max(1, Number(config.capturePollSeconds ?? 0) || CAPTURE_POLL_SECONDS_DEFAULT);
+  const afkThreshold = Math.max(30, Number(config.afkThresholdSeconds ?? 0) || AFK_THRESHOLD_DEFAULT);
+  const host = hostname();
+  const windowBucket = `lifehud-window_${host}`;
+  const afkBucket = `lifehud-afk_${host}`;
+
+  let db;
+  try {
+    db = openCaptureDb(dbPath);
+    ensureCaptureBucket(db, windowBucket, 'currentwindow', host);
+    ensureCaptureBucket(db, afkBucket, 'afkstatus', host);
+  } catch (error) {
+    noteCapture(`打不开采集库 ${dbPath}：${error instanceof Error ? error.message : String(error)}`);
+    return () => {};
+  }
+
+  const state = {
+    dbPath,
+    db,
+    host,
+    windowBucket,
+    afkBucket,
+    pollSeconds,
+    afkThreshold,
+    // pulsetime = max(pollSeconds * 2, 10) 秒：采样间隔的两倍，避免偶尔掉一拍就断开事件。
+    pulsetimeMs: Math.max(pollSeconds * 2, CAPTURE_PULSETIME_MIN_SECONDS) * 1000,
+    storeTitles: config.storeTitles !== false,
+    pending: [],
+    open: new Map(),
+    insertStmt: db.prepare('INSERT INTO events (bucket_id, ts, duration, data, source) VALUES (?, ?, ?, ?, ?)'),
+    updateStmt: db.prepare('UPDATE events SET duration = ? WHERE id = ?'),
+    child: null,
+    rl: null,
+    pid: null,
+    restarts: 0,
+    stopping: false,
+    restartTimer: null,
+    flushTimer: null,
+    noise: 0,
+    samples: 0,
+    rows: 0,
+    lastSampleAt: 0,
+    lastFlushAt: 0,
+    lastError: '',
+  };
+  captureRuntime = state;
+
+  installCaptureExitHook();
+  spawnCaptureChild(state);
+
+  state.flushTimer = setInterval(() => { flushCapture(state); }, CAPTURE_FLUSH_MS);
+  if (typeof state.flushTimer.unref === 'function') state.flushTimer.unref();
+
+  return () => stopCapture(state);
+}
+
+/**
+ * 收尾。顺序照规格：先 kill 子进程（别再进新样本）→ 落盘 → 关库。
+ * @param {object|null} [state] 运行时，默认当前单例
+ * @returns {void}
+ */
+function stopCapture(state = captureRuntime) {
+  if (!state || captureRuntime !== state) return;
+  captureRuntime = null;
+  state.stopping = true;
+
+  if (state.restartTimer) { clearTimeout(state.restartTimer); state.restartTimer = null; }
+  if (state.flushTimer) { clearInterval(state.flushTimer); state.flushTimer = null; }
+  try { state.rl?.close(); } catch { /* 已关闭 */ }
+  state.rl = null;
+  if (state.child) {
+    try { state.child.kill(); } catch { /* 已经退出 */ }
+    state.child = null;
+  }
+  try { flushCapture(state); } catch { /* 尽力落盘，失败也要关库 */ }
+  try { state.db?.close(); } catch { /* 已关闭 */ }
+  state.db = null;
+  state.pending.length = 0;
+  state.open.clear();
+}
+
+/**
+ * 采集器状态快照（给诊断区 / 探针用，不含数据库句柄）。
+ * @returns {object} status
+ */
+export function captureStatus() {
+  const state = captureRuntime;
+  const status = {
+    running: Boolean(state?.child && state.child.exitCode == null),
+    pid: state?.pid ?? null,
+    dbPath: state?.dbPath ?? null,
+    samples: state?.samples ?? 0,
+    rows: state?.rows ?? 0,
+    pending: state?.pending.length ?? 0,
+    restarts: state?.restarts ?? 0,
+    pollSeconds: state?.pollSeconds ?? null,
+    lastSampleAt: state?.lastSampleAt ? new Date(state.lastSampleAt).toISOString() : null,
+    lastError: state?.lastError || null,
+    warnings: [...captureWarnings],
+  };
+  return status;
 }
 
 /* ---------------------------------------------------------- 体重（小米云） */
@@ -1097,7 +1560,7 @@ export async function buildHud(config = {}, runtime = {}) {
   const bounds = discovered ?? DEFAULT_BOUNDS;
   const slot = slotForHour(new Date().getHours(), bounds);
 
-  const warnings = [];
+  const warnings = [...captureWarnings];
 
   const failActivity = (error) => {
     warnings.push(`activity: ${error instanceof Error ? error.message : String(error)}`);
@@ -1223,6 +1686,22 @@ function applyInner(ctx, config) {
   } catch (error) {
     try {
       ctx.logger?.warn?.(`[lifehud] weight sync timer not registered: ${error instanceof Error ? error.message : String(error)}`);
+    } catch { /* logging must not fail activation */ }
+  }
+
+  // 自采集（v1.1.1）：本机 PowerShell 采样前台窗口 + 空闲状态，把合并后的事件写进
+  // <dataDir>/capture.db。启动失败只进诊断，绝不影响页面本身起不来。
+  try {
+    ctx.effect(() => {
+      const stop = startCollector({ ...config, dataDir });
+      return () => {
+        try { stop(); } catch { /* 收尾失败不该阻塞卸载 */ }
+      };
+    }, 'lifehud: capture');
+  } catch (error) {
+    noteCapture(`采集器未启动：${error instanceof Error ? error.message : String(error)}`);
+    try {
+      ctx.logger?.warn?.(`[lifehud] capture not started: ${error instanceof Error ? error.message : String(error)}`);
     } catch { /* logging must not fail activation */ }
   }
 

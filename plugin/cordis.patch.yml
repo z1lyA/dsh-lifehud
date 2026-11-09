@@ -23,8 +23,15 @@
         # miDid: 'blt.3.<你的设备>'      # 只有自动发现失败时才需要
         # weightTtlMs: 600000            # 体重同步 TTL，默认 10 分钟
 
-        # ActivityWatch aw-server（本地 REST API），一般不用改。
-        activityWatchUrl: 'http://127.0.0.1:5600'
+        # 专注卡自采集（v1.1.1 起不再依赖 ActivityWatch 进程）：本机 PowerShell 采样，
+        # 不联网、不读其它应用的运行数据；数据只落 <dataDir>/capture.db。
+        # captureDb: ''                  # 采集库路径，默认 <dataDir>/capture.db
+        # capturePollSeconds: 2          # 采样间隔（秒）。2≈AW 的 1s 粒度；想省资源可调 5
+        # afkThresholdSeconds: 180       # 空闲超过该秒数算离开
+        # storeTitles: true              # 是否落库窗口标题；false 只存应用名（更隐私）
+        # historyImport: 'once'          # 'once'=首次全量迁移 AW 历史；'never'=不迁移
+        # historySource: ''              # 留空=自动推导 %LOCALAPPDATA%\activitywatch\…\peewee-sqlite.v2.db
+
         # 天气默认坐标；页面「设置 → 使用我的位置」会覆盖它。
         latitude: 39.9042
         longitude: 116.4074
