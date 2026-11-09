@@ -1,4 +1,4 @@
-﻿# Spike 结果：DSH 插件能不能画出页面 + 能不能读 NowTree
+# Spike 结果：DSH 插件能不能画出页面 + 能不能读 NowTree
 
 - 日期：2026-11-04（晚间第二轮迭代后更新）
 - 目标：只验证技术假设，再按用户反馈做界面形态迭代
@@ -146,3 +146,50 @@ DELETE /lifehud/api/photo   → 移除
 | `weightInflight` 单飞不分库 | `plugin/index.js` › `readWeight` | 改成 `Map<dbPath, Promise>`，回调里 `delete(dbPath)` | `probe-weight.mjs` 6.4 改成两向断言后 PASS |
 
 修完 **46 PASS / 0 FAIL**（`node spike/probe-weight.mjs`，2026-11-09 21:0x）。
+
+---
+
+## v1.1.1 专注卡脱离 ActivityWatch（2026-11-10）
+
+- **目标**：关掉甚至卸载 ActivityWatch，专注卡/热力卡照常有真实数据；同时把采到的原始数据完整留存（为 1.2 详情页留料）。
+- **做法**：`plugin/collector.ps1`（Windows 自带 PowerShell 5.1 + C# P/Invoke，零安装）每 2 秒输出一行 JSON → Host 合并成带 `duration` 的事件 → `<dataDir>/capture.db`（`buckets` + `events.data` 原始 JSON + `meta`）→ `readOwnActivity()` 聚合 → 卡片契约不变。
+- **AW 只在一处出现**：首次启动的一次性迁移 `importHistory()`。
+- **验证脚本**：`spike/probe-capture.mjs`（45 项）、`spike/probe-hud.mjs`（确定性 20 项）、`spike/probe-hud.mjs --real`（真实库 23 项）、`spike/probe-weight.mjs`（46 项回归）。
+
+### 实测数字（2026-11-10 00:0x，本机）
+
+| 项 | 值 |
+|---|---|
+| AW 库迁移 | 3 bucket：`aw-watcher-window_<host>` 18,436 条、`aw-watcher-afk_<host>` 693 条、`aw-stopwatch` 0 条；合计 **19,129 条**，全部 `source='aw-migrated'` |
+| 分类规则 | `meta.aw_classes` = 16 条（`[{name:["Work","Programming"], rule:{…}}, …]` 原文） |
+| 幂等 | 二次 `importHistory()` → `skipped:'already'`，0 新增行 |
+| 实时采集 | `capture: {running:true, pollSeconds:2, samples 递增, restarts:0, noise:0}`；10 秒内 15 → 20 个样本 |
+| 聚合性能 | 19,992 行时 `readOwnActivity()` **68 ms**（84 天 + AFK 扣除 + 24h 聚合全算完） |
+| 断 AW 后 | `/lifehud/api/hud` 的 `focus.available=true`、`top` 6 个真实应用、`warnings: []`、热力 13 天非零（与 AW 时代的 13 天一致，无断档） |
+| 库体积 | 迁移 19,129 条后 `capture.db` ≈ 5.4 MB（WAL 模式） |
+
+### 值得记住的发现
+
+1. **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**。`WHERE bucket_id = '<aw bucket id>'` 会静默返回 0 行——只有 `JOIN bucketmodel b ON b.key = e.bucket_id` 才对。第一版迁移就是被这个坑到「以为 AW 里只有 0 条」。
+2. **AW 的时间戳是 `"2026-11-09 15:54:03.180000+00:00"`**（空格分隔 + 微秒 + 显式 UTC 偏移），`Date.parse` 能直接吃；别自己切字符串。
+3. **AW 里有 `duration: 0` 的心跳**（本机 5,764 条）。迁移要原样保留（一个字段都不丢），但**聚合时必须跳过**（`e.duration > 0`），否则会把应用时长摊薄。
+4. **PowerShell 5.1 在管道下按 OEM/ANSI 输出**：不设 `[Console]::OutputEncoding = UTF8(no BOM)`，中文窗口标题到 Node 侧就是 U+FFFD 乱码。脚本本身必须纯 ASCII（PS 5.1 按 ANSI 读脚本）。
+5. **未闭合事件必须「先 INSERT 再 UPDATE duration」**：合并语义下"同一个应用连续 8 小时"只有一行；如果只在事件切换时才落盘，页面最长一小时都看不到新数据。代价是每 60s 一次 UPDATE，可忽略。
+6. **WAL + busy_timeout 是必需的**：写句柄常驻、每次 `/hud` 另开只读连接读同一库，默认 journal 模式偶发 `SQLITE_BUSY`。只读连接读 WAL 库没问题（实测：干净关闭与写者在线两种情形都能读）。
+7. **采集器必须「收到样本就清零重启计数」**：指数退避封顶 5 次，若不归零，跑几周后被历史崩溃次数永久停采。
+
+### 主动取舍（与需求规格的偏差）
+
+1. 合并语义按规格（`duration = 最后匹配样本时间 - 事件起点`），所以每次应用切换会丢 ↔ 一个采样间隔（2 秒）；与 AW 的 `heartbeat_merge` 同一量级。
+2. 迁移**不按 (bucket, ts) 去重**：AW 里确实存在同 bucket 同 timestamp 的不同事件，去重会丢数据；幂等靠 `meta.history_imported` + 「重跑时库中已有」实现。
+3. `trackingMinutes` 不含被过滤的空转段（`explorer.exe + Program Manager`），与旧口径一致；`longest.app` 仍是原始 exe 名（不套别名），保持 v1.1.0 前端契约。
+4. 「专注卡采集」开关**只管展示**（客户端 localStorage），Host 仍采集；真正停采要新增 Client → Host 通道，留给 1.2。
+5. 迁移在 `applyInner()` 里**同步执行且早于 `startCollector()`**（19k 行约数百毫秒），换来「迁移与实时采集时段天然不重叠」。
+
+### 未覆盖 / 已知限制
+
+- **「关闭 DSH 后无残留 powershell」**只在探针里验证到 dispose 层（`child.kill()` 后按命令行查无残留 + `process.on('exit')` 兜底）；真·关闭 DSH 需用户操作。
+- **浏览器渲染**（卡片三种状态、5 分钟自动刷新、深浅主题）由页面验收，不在 probe 覆盖范围。
+- **锁屏**：`GetLastInputInfo` 只反映当前会话，与 AW v0.14.1 行为一致；锁屏时前台通常变成 `explorer.exe + Program Manager`，已被过滤。
+- **7×24 采集不做**：DSH 没运行的时间段没有数据。
+

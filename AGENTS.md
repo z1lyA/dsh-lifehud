@@ -1,7 +1,7 @@
 # AGENTS.md — dsh-lifehud 协作手册
 
 > 给接手的 AI：读这一份就能继续开发。**只写长期稳定的事实**，版本细节写 `spike/RESULT.md`。
-> 最后更新：2026-11-09 ｜ 插件版本：1.1.0
+> 最后更新：2026-11-10 ｜ 插件版本：1.1.1
 
 ---
 
@@ -11,9 +11,11 @@
 |---|---|
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡）、`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项） |
+| 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 45 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项） |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
+| 认识专注卡那条链路 | 本文件 §7「专注卡怎么工作」+ `plugin/collector.ps1`，代码入口 `startCollector()` / `readOwnActivity()` |
 | 看踩过的坑 | 本文件 §6 + `spike/RESULT.md` |
 
 **仓库身份**：`z1lyA/dsh-lifehud`（**公开、唯一仓库**，`origin` 指向它）。本机目录名 `dsh-lifehud`；插件注册的是 `link:<仓库>/plugin`。
@@ -25,7 +27,8 @@
 ## 1. 这是什么
 
 **LifeHud** 是长在 DeepSeek Harness（DSH）里的个人工作台：一块「抬头就能看见」的页面。
-它自己**不产生数据**，只把已有的东西聚到一屏：NowTree 的任务、Open-Meteo 的天气、DSH 的会话、ActivityWatch 的专注。
+它自己**几乎不产生数据**：只把已有的东西聚到一屏——NowTree 的任务、Open-Meteo 的天气、DSH 的会话；
+唯一自己产的是「专注 / 热力」（v1.1.1 起由 `plugin/collector.ps1` 采本机前台窗口与空闲状态，写进 `<dataDir>/capture.db`）。
 
 - 语言：**纯 JavaScript（ESM）**，零第三方依赖，不打包、不编译
 - 前端：`React.createElement`（**不要写 JSX**，这里没有编译器）
@@ -60,8 +63,9 @@ package.json 的 dsh.client + exports["./client"] → 浏览器加载 client.js
 plugin/            ← 唯一会被 DSH 加载的东西
   package.json     dsh.bundle / dsh.client / exports
   cordis.patch.yml Host 行的 config（默认值都在代码里推导，这里通常不用改）
-  index.js         Host：HTTP 路由 + 五个数据源
+  index.js         Host：HTTP 路由 + 数据源 + 采集（startCollector/readOwnActivity）+ 迁移
   client.js        浏览器：设置、卡片、渲染
+  collector.ps1    专注采集器：长驻 PowerShell 子进程，每 N 秒输出一行 JSON
 spike/             探查脚本与结论（probe-*.mjs、paths.mjs、RESULT.md）
 docs/              公开文档：ADR（架构决策）+ 小米云取数方法
 notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档/原型），整目录被 `.gitignore` 忽略
@@ -78,14 +82,15 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 | NowTree 时段分界 | `%LOCALAPPDATA%\com.nowtree.app\EBWebView\Default\Local Storage\leveldb` | 字节搜索 `nowtree_slot_bounds`，取后面的 `{"morningStart":…}` | 值可能是 UTF-16，用 latin1 + 正则兜底；读不到就回退 6/13/18 |
 | 天气 | `https://api.open-meteo.com/v1/forecast` | 无需 key；`hourly=temperature_2m,precipitation_probability,weather_code,is_day` | Host 缓存 10 分钟；换位置后置空缓存 |
 | DSH 会话 | `$DSH_HOME/storages/session_projcache/sessions/session-<uuid>.json` | 读 json，`rows.title.val` + `rows.sessionListMetadata.val.lastPromptAt` | **sessionId 就是文件名里的 uuid**（去掉 `session-` 前缀）。不要解压 `session.v4.jsonl.zstd` |
-| ActivityWatch | `http://127.0.0.1:5600` | `/api/0/buckets/` 找 bucket，再取 `.../events?start=&end=` | `/api/0/query/` 传中文 bucket 名会 400，用 events 端点自己聚合；**必须减掉 AFK 区间**，否则 explorer.exe 会占几百分钟 |
+| 专注 / 热力 | **自采集**：`plugin/collector.ps1` → `<dataDir>/capture.db` | Host spawn 长驻 PowerShell 子进程，stdout 每 2 秒一行 JSON；Host 合并成带 `duration` 的事件写库；页面只读库 | 零安装（PowerShell 5.1 + C# P/Invoke）；`storeTitles:false` 只存应用名；**AFK 区间必须从窗口事件里扣掉**，否则 explorer.exe 会占几百分钟；采集器只能由 Host 启停（见 §6 孤儿进程） |
+| ActivityWatch（历史） | `%LOCALAPPDATA%\activitywatch\activitywatch\aw-server\peewee-sqlite.v2.db` | 只在 **首次迁移** 时读一次文件（先复制含 -wal/-shm 的副本到 tmpdir 再只读打开），把全部 bucket + `events.data` 原始 JSON + `settings.json` 的 `classes` 搬进 `capture.db` | **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**——用 id 文本查会静默返回 0 行；迁移幂等（`meta.history_imported`）；运行期**零 AW 依赖** |
 | 体重 | 小米云 `https://api.io.mi.com/app/user/get_user_device_data` | POST，`type=weight` / `key=bodyInfo` / `group=raw`，**时间单位是秒**；RC4 签名 + 会话文件 | 会话默认读 `<dataDir>/mi-session.json`（**不进 git**）；设备号**自动发现**（`/home/device_list` 里 model 带 `scales` 的那台），不写死；`weightId` 必须按 TEXT 存；Host 每 10 分钟自动同步，`?force=1` 跳过 TTL。细节见 `docs/小米云取数.md` |
 
 ## 5. 约定（照做）
 
 1. **零依赖**。不要 `pnpm add`：这个插件靠 Node 内置模块 + 原生 fetch 跑。
 2. **所有路由必须自己鉴权**。DSH **不会**给插件路由加会话保护——页面 `/` 返回 401，但 `/lifehud/api/*` 是裸的。现有做法：`isLocalPeer(req)` 只放行 `127.0.0.1 / ::1 / ::ffff:127.0.0.1`。新增路由必须照抄。
-3. **不写任何外部数据源**。NowTree 的库、AW 的库、DSH 的会话全部只读；LifeHud 自己的可写状态只放在 `dataDir`（默认 `~/.dsh/lifehud`）。
+3. **不写任何外部数据源**。NowTree 的库、AW 的库、DSH 的会话全部只读（AW 只在首次迁移时读一次文件）；LifeHud 自己的可写状态只放在 `dataDir`（默认 `~/.dsh/lifehud`）：体重镜像库 + 专注采集库 `capture.db`。
 4. **界面文案中文**（"LifeHud" 这个品牌名除外，保持英文）。
 5. **主题适配**：只用 `currentColor` 和 `rgba(128,128,128,α)`，不写死颜色，深/浅主题都要看一眼。
 6. **改 Host 就重新装一次**（remove → install），**改 Client 就刷新页面**。
@@ -106,20 +111,51 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **体重曲线是「最近有数据的 7 个测量日」**，不是连续 7 天：同一天多次只留最后一次，日期可以不连续，折线仍是一条连续 polyline（缺失日不断开）。
 - **DSH Web 端口每次启动都会变**（2026-11-09 一天内就从 `59098 → 51879 → 55910 → 50073` 变过几次）。spike / 探针脚本里**别硬编码端口**：要么从运行时上下文取，要么把 URL 做成参数（`node spike/probe-weight.mjs http://127.0.0.1:<端口>`），否则重启一次就全红。
 - **体重卡的图表不能用 SVG `<text>`**：SVG 走 `preserveAspectRatio="none"` 做自适应拉伸，`<text>` 会被非等比拉变形。所有文字（纵轴刻度、点值、日期）一律用 HTML 绝对定位覆盖层。
+- **AW 的 `eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**。拿 `id` 文本去 `WHERE bucket_id = ?` 会**静默返回 0 行**（2026-11-10 实测踩到）。迁移必须 `JOIN bucketmodel b ON b.key = e.bucket_id`。
+- **PowerShell 子进程的 stdout 编码**：Windows PowerShell 5.1 在管道下默认按 ANSI/OEM 输出，中文窗口标题到 Node 侧就是乱码。`collector.ps1` 开头必须 `[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)`；脚本本身保持**纯 ASCII**（PS 5.1 按 ANSI 读脚本，非 ASCII 字节会被误读）。
+- **采集器绝不能靠 `spawn('powershell')` 依赖 PATH，也不要点名 `pwsh`**（本机没有）。用 `join(process.env.WINDIR, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')`；脚本路径用 `fileURLToPath(new URL('./collector.ps1', import.meta.url))`。
+- **孤儿进程**：采集器是长驻子进程，disposer 顺序必须是 `child.kill()` → `flushPending()` → `db.close()`，另注册一次 `process.on('exit')` 兜底。重启要指数退避并封顶（5 次），收到有效样本就把计数清零（否则跑几周后被历史崩溃次数拖死）。
+- **capture.db 用 WAL**（`journal_mode=WAL` + `synchronous=NORMAL` + `busy_timeout=3000`）：写句柄常驻、页面每次请求另开只读连接，没有 WAL 会偶发 `SQLITE_BUSY`。代价是 `dataDir` 里会多出 `capture.db-wal` / `-shm`（`.gitignore` 已挡 `capture.db*`）。
+- **未闭合事件也要先落盘**：合并语义下"同一个应用 8 小时"只有一行，如果只在事件切换时才 INSERT，页面一小时内会一直是空的。做法是首个样本就 INSERT，之后每 `CAPTURE_FLUSH_MS`（60s）原地 `UPDATE duration`。
+- **迁移与实时采集的时序**：必须在 `startCollector()` **之前**跑 `importHistory()`，靠 `meta.history_imported='1'` 保证幂等；否则两段数据会重叠。
+- **AW 停了以后别指望它回来**：本机 2026-11-10 按验收要求停掉了 aw-qt / aw-server / aw-watcher-afk / aw-watcher-window，插件不再依赖它们（只迁移时读文件）。要恢复 AW 得用户自己启动。
 
 ## 7. 当前状态
 
-- ✅ 七张卡：当前时段任务、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图）、热力日历（当月 · GitHub 风格）、相框、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线）**。
+- ✅ 七张卡：当前时段任务、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图，**v1.1.1 起数据自己采**）、热力日历（当月 · GitHub 风格）、相框、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线）**。
   「网页对话 ↗」是工具条上的外链按钮（`window.open`），**不是卡片**。
 - ✅ 布局：flex 便当盒两行 —— 行 1 = 天气(宽) · 体重 · 任务；行 2 = 专注 · 会话 · 相框 · 热力。
   （体重与热力 2026-11-09 换过位置：体重进更高的第一行、热力下到第二行第四格。）
   体重卡用 `Card` 的 `cellStyle` 给了 `flex: 1.2 1 0`（比任务卡略宽），要再调就改这一个数。
-- ✅ 设置窗口：背景（无/渐变/纯色/图片 URL）、天气小时数、**体重卡开关**、网页对话地址、定位、诊断。
+- ✅ 设置窗口：背景（无/渐变/纯色/图片 URL）、天气小时数、**体重卡开关**、**专注卡采集开关**（v1.1.1，只管展示）、网页对话地址、定位、诊断。
   这些界面设置存在浏览器 **localStorage**（键 `lifehud.settings.v1`）；Host 侧的 `lifehud-settings.json` 只存 `latitude/longitude/locationName/appAliases`。
 - ✅ 开机预热：Host `apply()` 里先跑一次 `buildHud` + `readWeight`；Client 加载时 `fetchHud()` / `fetchWeight()` 预取。
+- ✅ HUD 自动刷新（v1.1.1）：Client `useHud()` 每 5 分钟静默重取一次（页面隐藏时不发请求，`visibilitychange` 回页面补一次；三道护栏防并发：hidden / `prefetch` 在飞 / `HUD_TTL` 未过期都跳过）。
 - ✅ 体重同步：Host 每 10 分钟自动拉一次小米云（定时器可 dispose）；页面「刷新」按钮带 `?force=1` 立即拉，**这是"刚踩秤就能看到"的主路径**。
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
 - ⚠️ 天气的"一句话"是规则拼的，不是模型生成。
+
+### 专注卡怎么工作（v1.1.1，重要）
+
+```
+Windows user32/kernel32
+   ↑ P/Invoke（C#，靠 Windows 自带 PowerShell 5.1 在内存里编译，零安装）
+plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF-8）
+   └→ Host startCollector()   spawn + readline；崩了指数退避重启（≤5 次，收到样本即清零）
+      └→ appendSample()       窗口流 / AFK 流各一条未闭合事件；同 data 且间隔 ≤ pulsetime(≥10s) 就延长
+         └→ <dataDir>/capture.db   node:sqlite（WAL）—— buckets + events(data 原始 JSON) + meta
+            └→ readOwnActivity()  JOIN buckets 按 type 取窗口/AFK 两条流；窗口时长扣掉 AFK 区间
+               └→ buildHud()       → focus / heatmap（与 v1.1.0 的 AW 版本**完全同构**，Client 一行没改）
+                  └→ GET /lifehud/api/hud   （另含 capture: captureStatus() 诊断字段）
+```
+
+- **写读分离**：采集只由 Host 后台做，页面请求只读本地库，不触发采集、不联网。
+- **AFK**：`idle ≥ afkThresholdSeconds`（默认 180）记为 `afk` 区间，聚合时从每个窗口事件里扣掉；另外 `explorer.exe + Program Manager` 一律丢弃（锁屏/桌面焦点）。
+- **迁移**：首次启动 `importHistory()` → 复制 AW 库副本（含 `-wal`/`-shm`）到 tmpdir → 只读打开 → 全部 bucket + `events.data` 原样 + `settings.json` 的 `classes` 进 `meta.aw_classes` → `meta.history_imported='1'`（幂等）。**迁完就可以卸载 AW**。
+- **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]`，卡片显示「还没有采集到数据」，HUD 其余部分照常。
+- **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, rows, pending, restarts, pollSeconds, lastSampleAt, lastError, warnings[]}`；采集器 stderr / 退出码 / 迁移失败都会进 `warnings`（设置 → 诊断区可见）。
+- **改它的入口**：`plugin/collector.ps1`（采样）、`startCollector/appendSample/flushCapture`（合并与落盘）、`readOwnActivity`（聚合）、`importHistory`（迁移）。
+- **验证**：`node spike/probe-capture.mjs`（45 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等）、`node spike/probe-hud.mjs`（确定性 20 项）、`node spike/probe-hud.mjs --real`（真实库 23 项）。
 
 ### 体重卡怎么工作（v1.1.0，重要）
 
@@ -175,8 +211,9 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
 1. 默认页 / 侧栏收起（需要 spike DSH 的 layout 服务）。
 2. 会话卡点击跳转的兜底方案（若 `uiWorkspace` 不可达）。
 3. 体重 v2：体脂 / 肌肉 / BMI 人形图（`weight.raw_json` 已经把 40 个字段全存下来了）、体重目标线。
-4. HUD 快照自动刷新（目前只有体重有定时同步，其余靠手动「刷新」）。
-5. 热力日历换指标（当前是 AW 的每日活跃分钟；token 需自建日表）。
+4. **专注卡详情页（1.2）**：`capture.db` 已经留好料——`events.data` 是原始 JSON（app/title/status 一个字段不丢）、`meta.aw_classes` 存了 16 条分类正则、`source` 能区分 `live` / `aw-migrated`。可算：应用占比/趋势、切换次数与碎片化指数、标题 Top、24h 节律、AFK 比例、按 `classes` 的分类饼图。
+5. 专注卡「关掉=真停采」：目前开关只影响展示（Host 仍在采集），要做需要 Client → Host 的通道（比如 `POST /lifehud/api/capture {enabled}`）。
+6. 热力日历换指标（当前是本地采集库的每日活跃分钟；token 需自建日表）。
 
 ## 9. 与用户协作的方式
 
@@ -229,7 +266,7 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
 | 类型 | 放哪 | 说明 |
 |---|---|---|
 | 调研笔记、心智记录、布局原型、写真实作息/体型的文档 | 仓库内的 `notes/`（`.gitignore` 整目录忽略） | 本地可见、和代码放一起；`git status` 不会提示，永远提交不上去 |
-| 运行时私人数据（`mi-session.json`、体重库、设置、相框） | `~/.dsh/lifehud`（仓库外） | 插件自己读写，`.gitignore` 也挡了同名文件 |
+| 运行时私人数据（`mi-session.json`、体重库、专注采集库 `capture.db`、设置、相框） | `~/.dsh/lifehud`（仓库外） | 插件自己读写，`.gitignore` 也挡了同名文件 |
 
 所以对本仓库的唯一要求是：**别把上面两类东西 commit 进来**。提交前跑一次：
 
@@ -239,7 +276,7 @@ node spike/prepublish-check.mjs      # 扫 PII：绝对路径 / 用户名 / 邮�
 
 必守：
 
-- **绝不提交** `mi-session.json`、`lifehud-weight.db`、`lifehud-settings.json`、`.env`（`.gitignore` 已挡）；
+- **绝不提交** `mi-session.json`、`lifehud-weight.db`、`lifehud-settings.json`、`capture.db`、`.env`（`.gitignore` 已挡）；
 - 文档里写路径一律用 `%APPDATA%` / `%LOCALAPPDATA%` / `~` / `<仓库>` 这类占位，不写某台机器的绝对路径；
 - 代码里的默认值必须是**推导**出来的（`process.env.APPDATA`、`homedir()`），不是写死的；
 - 不把任何人的设备号（`blt.3.*`）、账号 id、token 写进代码或文档；
