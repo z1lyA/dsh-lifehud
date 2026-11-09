@@ -994,14 +994,19 @@ if (!window.__lifehudClientRegistered) {
                   onClick: () => set({ weightCard: s.weightCard === false }),
                 }, s.weightCard !== false ? '显示' : '不显示'),
               ]),
-              // 专注卡采集开关：和上面「体重卡」同一种写法（两个胶囊状态的按钮），
+              // 专注卡开关：和上面「体重卡」同一种写法（两个胶囊状态的按钮），
               // 旧设置里没有这个键 → `!== false` 视为开，升级后默认就有专注卡。
-              h('div', { key: 'fc', style: { display: 'flex', gap: 12, alignItems: 'center', marginTop: 10 } }, [
-                h('span', { key: 'l', style: { color: T.text2 } }, '专注卡采集'),
-                h('button', {
-                  key: 'b', type: 'button', style: pill(s.focusCapture !== false),
-                  onClick: () => set({ focusCapture: s.focusCapture === false }),
-                }, s.focusCapture !== false ? '开启' : '关闭'),
+              // 文案故意说清楚「只管显示」：Host 侧的采集不受这个开关影响（停采是 1.2 的事），
+              // 隐私敏感的人不该被「关闭」两个字骗到。
+              h('div', { key: 'fc', style: { marginTop: 10 } }, [
+                h('div', { key: 'row', style: { display: 'flex', gap: 12, alignItems: 'center' } }, [
+                  h('span', { key: 'l', style: { color: T.text2 } }, '专注卡'),
+                  h('button', {
+                    key: 'b', type: 'button', style: pill(s.focusCapture !== false),
+                    onClick: () => set({ focusCapture: s.focusCapture === false }),
+                  }, s.focusCapture !== false ? '显示' : '隐藏'),
+                ]),
+                h('div', { key: 'hint', style: { ...S.dim, marginTop: 4 } }, '只影响这张卡是否显示，本机采集照常进行'),
               ]),
               h('div', { key: 'cu', style: { marginTop: 10 } }, [
                 h('div', { key: 'l', style: { color: T.text2, marginBottom: 6 } }, '网页对话地址'),
