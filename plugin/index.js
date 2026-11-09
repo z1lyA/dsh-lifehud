@@ -549,8 +549,14 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
     }
 
     const endMs = startMs + duration * 1000;
+    // 扣掉 AFK 后的活跃秒数。**热力与「最近 24 小时」必须同一口径**：
+    // v1.1.0 的老实现只把 AFK 扣进热力，24h 的 tracking/top/longest 用的是原始时长，
+    // 于是出现过「tracking 705 分钟、而同一天热力只有 354 分钟」的自相矛盾（2026-11-10 验收发现）。
     const seconds = afkSpans.length > 0 ? activeSeconds(startMs, endMs) : duration;
     if (seconds < 1) continue;
+    // AFK 区间不精确切分到事件内部，按占比例摊到整段上：热力与 24h 数字用同一个比例，
+    // 就不会再出现两套口径打架。
+    const activeRatio = seconds / duration;
 
     // 锁屏 / 桌面焦点在窗口流里是 explorer.exe + "Program Manager"，不是真实工作。
     // 光靠 AFK 抓不住（机器可能被锁屏而不是空闲），所以把这个明显的空转段丢掉。
@@ -562,8 +568,9 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
     perDay.set(dayKey(startMs), (perDay.get(dayKey(startMs)) ?? 0) + seconds);
 
     if (endMs < since24) continue;
-    // 只算落在 24 小时窗口里的那一段。
-    const inside = Math.max(0, (Math.min(endMs, now.getTime()) - Math.max(startMs, since24)) / 1000);
+    // 只算落在 24 小时窗口里的那一段，再乘活跃占比（同样是扣 AFK 后的口径）。
+    const overlap = Math.max(0, (Math.min(endMs, now.getTime()) - Math.max(startMs, since24)) / 1000);
+    const inside = overlap * activeRatio;
     if (inside < 1) continue;
     recentSeconds += inside;
     recentByApp.set(appName, (recentByApp.get(appName) ?? 0) + inside);

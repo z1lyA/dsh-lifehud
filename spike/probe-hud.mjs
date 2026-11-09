@@ -64,7 +64,7 @@ function seedCaptureDb(dbPath) {
 
   const expected = new Map();
 
-  // ---- 最近 3 小时（全部落在 24h 滚动窗口里，所以 top 的分钟数就是原始时长）----
+  // ---- 最近 3 小时（全部落在 24h 滚动窗口里；分钟数是「扣掉 AFK 后」的活跃时长）----
   const t0 = now - 180 * MIN;
   win('Code.exe', 'index.js - VS Code', t0, 90);
   win('explorer.exe', 'Program Manager', t0 + 90 * MIN, 40); // 空转段，必须被过滤
@@ -189,19 +189,19 @@ try {
   check('窗口口径是 24h', focus.window === '24h', focus.window);
   check('top 非空', Array.isArray(focus.top) && focus.top.length > 0,
     (focus.top ?? []).map((a) => a.app).join(', '));
-  check('top[0] = Code（别名 → VS Code）90 分钟',
-    focus.top?.[0]?.app === 'VS Code' && focus.top?.[0]?.minutes === 90,
+  check('top[0] = Code（别名 → VS Code）60 分钟（90 分钟里 30 分钟 AFK）',
+    focus.top?.[0]?.app === 'VS Code' && focus.top?.[0]?.minutes === 60,
     JSON.stringify(focus.top?.[0]));
-  check('top 排序 / 分钟数正确（90 / 40 / 5）',
-    JSON.stringify((focus.top ?? []).map((a) => a.minutes)) === '[90,40,5]',
+  check('top 排序 / 分钟数正确（60 / 40 / 5）',
+    JSON.stringify((focus.top ?? []).map((a) => a.minutes)) === '[60,40,5]',
     JSON.stringify((focus.top ?? []).map((a) => a.minutes)));
   check('explorer.exe + Program Manager 被过滤',
     !(focus.top ?? []).some((a) => /文件资源管理器|explorer/i.test(a.app)));
   check('duration=0 的事件不参与聚合', !(focus.top ?? []).some((a) => /cmd/i.test(a.app)));
-  // 90（Code）+ 40（Edge）+ 5（微信）= 135；空转段与 duration=0 都不算进来。
-  check('trackingMinutes = 135（90+40+5）', focus.trackingMinutes === 135, String(focus.trackingMinutes));
-  check('longest 用原始 app 名、90 分钟',
-    focus.longest?.app === 'Code.exe' && focus.longest?.minutes === 90
+  // 60（Code：90 分钟扣 30 分钟 AFK）+ 40（Edge）+ 5（微信）= 105；空转段与 duration=0 都不算进来。
+  check('trackingMinutes = 105（60+40+5，AFK 已扣）', focus.trackingMinutes === 105, String(focus.trackingMinutes));
+  check('longest 用原始 app 名、60 分钟（同上扣 AFK）',
+    focus.longest?.app === 'Code.exe' && focus.longest?.minutes === 60
     && focus.longest?.title === 'index.js - VS Code', JSON.stringify(focus.longest));
 
   check('heatmap 恰好 84 天', payload.heatmap.length === 84, String(payload.heatmap.length));
