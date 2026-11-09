@@ -50,6 +50,13 @@ if (!window.__lifehudClientRegistered) {
       /** @type {{at:number,value:object}|null} */
       let hudCache = null;
       const HUD_TTL = 60 * 1000;
+      /**
+       * 定时自动刷新间隔（5 分钟）。
+       * 为什么是 5 分钟：一次 /hud 要开 NowTree 的库、扫会话文件、算热力，
+       * 30 秒一次等于让后台一直干活、笔记本风扇都听得见；5 分钟够让人「抬头看见变化」，
+       * 真着急的时候还有工具条上的「刷新」按钮。
+       */
+      const HUD_REFRESH_MS = 5 * 60 * 1000;
       let prefetch = null;
 
       function fetchHud() {
@@ -80,6 +87,10 @@ if (!window.__lifehudClientRegistered) {
           weatherHours: 8,
           chatUrl: 'https://chat.deepseek.com/',
           weightCard: true,
+          // 专注卡采集开关（v1.1.1，默认开）：关掉后专注卡只显示「已关闭」。
+          // 和 weightCard 一样存在浏览器 localStorage（同一个键），刷新页面仍然记得。
+          // 语义是「这块屏上要不要看采集结果」，不动 Host 侧已有的数据。
+          focusCapture: true,
         };
       }
 
@@ -154,6 +165,42 @@ if (!window.__lifehudClientRegistered) {
           });
           return () => { alive = false; };
         }, [tick]);
+
+        /**
+         * 定时 + 回页自动刷新（v1.1.1）。
+         * 以前只有体重卡有后台同步，其余卡片不点「刷新」就一直停在打开页面那一刻的快照上，
+         * 天气、任务、会话都可能是几小时前的。这里补上「自己会变」。
+         *
+         * 刻意做成"安静"的刷新，三道护栏（避免和首屏 prefetch、手动刷新打架）：
+         *   1. 页面不可见（切到别的窗口/标签）时一个请求都不发，回来再补；
+         *   2. 已经有请求在飞（`prefetch` 非空）就跳过——fetchHud 本身是单飞的，
+         *      再调也只是拿回同一个 Promise，这里先挡一道免得重复 setState；
+         *   3. 缓存还新鲜（< HUD_TTL）就跳过，避免「刚刷新完定时器紧接着又刷一次」。
+         * 失败也不弹错：保留上一次的数据，等下一个周期再试（不要每 5 分钟红条一次）。
+         */
+        React.useEffect(() => {
+          let alive = true;
+          const refreshQuietly = () => {
+            if (!alive || document.hidden) return;
+            if (prefetch) return;
+            if (hudCache && Date.now() - hudCache.at < HUD_TTL) return;
+            fetchHud().then((data) => {
+              if (!alive || !data) return;
+              setState({ loading: false, data, error: null });
+            });
+          };
+          const timer = setInterval(refreshQuietly, HUD_REFRESH_MS);
+          // 回到页面时补一次：隐藏期间定时器被浏览器降频，这次才是真正的"回页即新"
+          const onVisibility = () => { if (!document.hidden) refreshQuietly(); };
+          document.addEventListener('visibilitychange', onVisibility);
+          // 卸载（离开 LifeHud 页）必须停掉定时器与监听，否则组件没了还在偷偷请求
+          return () => {
+            alive = false;
+            clearInterval(timer);
+            document.removeEventListener('visibilitychange', onVisibility);
+          };
+        }, []);
+
         return { ...state, reload: () => setTick((v) => v + 1) };
       }
 
@@ -947,6 +994,15 @@ if (!window.__lifehudClientRegistered) {
                   onClick: () => set({ weightCard: s.weightCard === false }),
                 }, s.weightCard !== false ? '显示' : '不显示'),
               ]),
+              // 专注卡采集开关：和上面「体重卡」同一种写法（两个胶囊状态的按钮），
+              // 旧设置里没有这个键 → `!== false` 视为开，升级后默认就有专注卡。
+              h('div', { key: 'fc', style: { display: 'flex', gap: 12, alignItems: 'center', marginTop: 10 } }, [
+                h('span', { key: 'l', style: { color: T.text2 } }, '专注卡采集'),
+                h('button', {
+                  key: 'b', type: 'button', style: pill(s.focusCapture !== false),
+                  onClick: () => set({ focusCapture: s.focusCapture === false }),
+                }, s.focusCapture !== false ? '开启' : '关闭'),
+              ]),
               h('div', { key: 'cu', style: { marginTop: 10 } }, [
                 h('div', { key: 'l', style: { color: T.text2, marginBottom: 6 } }, '网页对话地址'),
                 h('input', { key: 'i', style: input, value: s.chatUrl, onChange: (e) => set({ chatUrl: e.target.value }) }),
@@ -974,6 +1030,9 @@ if (!window.__lifehudClientRegistered) {
           const [showSettings, setShowSettings] = React.useState(false);
           // 体重卡开关：关掉时既不渲染卡片、也不发 /weight 请求（hook 内部按 enabled 短路）
           const weightOn = settings.weightCard !== false;
+          // 专注卡采集开关：关掉时卡片还在原位，但只说「已关闭」——
+          // 比整格消失更好懂（用户知道自己是关掉的，而不是坏了）。
+          const focusOn = settings.focusCapture !== false;
           const weight = useWeight(weightOn);
           const [locateError, setLocateError] = React.useState(null);
           const [toast, setToastText] = React.useState(null);
@@ -1095,10 +1154,14 @@ if (!window.__lifehudClientRegistered) {
                   : null,
               ]));
 
+          // 专注卡：三种状态 —— 关掉了 / 有数据 / 还没采到。
+          // 空态文案不再提 ActivityWatch：数据已改成本机自采集，那个名字对用户只是噪音。
           const focusCard = h(Card, { key: 'focus', title: '专注 · 最近 24 小时' },
-            focus?.available
-              ? h(BarRows, { items: focus.top, limit: 5 })
-              : h('div', { key: 'e', style: S.empty }, 'ActivityWatch 没有数据'));
+            focusOn
+              ? (focus?.available
+                ? h(BarRows, { items: focus.top, limit: 5 })
+                : h('div', { key: 'e', style: S.empty }, '还没有采集到数据'))
+              : h('div', { key: 'off', style: S.empty }, '已关闭'));
 
           const heatCard = h(Card, { key: 'heat', title: `${nowMonth}月活跃热力` },
             h(MonthHeat, { days: data?.heatmap ?? [] }));
