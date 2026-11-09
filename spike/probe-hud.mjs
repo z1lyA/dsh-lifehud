@@ -273,8 +273,22 @@ try {
     check('真实库：专注卡可用', real.focus.available === true);
     check('真实库：top 非空', (real.focus.top ?? []).length > 0,
       (real.focus.top ?? []).map((a) => a.app).join(', '));
-    check('真实库：84 天热力里有历史的那些天 m>0',
-      real.heatmap.filter((d) => d.m > 0).length > 20, `${real.heatmap.filter((d) => d.m > 0).length} 天`);
+
+    // 真实库里窗口事件覆盖的每一天，热力日历都不该是 0（今天除外：它刚开了个头）
+    const db = new DatabaseSync(realConfig.captureDb, { readOnly: true });
+    let eventDays = [];
+    try {
+      eventDays = [...new Set(db.prepare(
+        "SELECT e.ts AS ts FROM events e JOIN buckets b ON b.id = e.bucket_id WHERE b.type = 'currentwindow'",
+      ).all().map((row) => Date.parse(row.ts)).filter((ms) => Number.isFinite(ms)).map(dayKey))];
+    } finally {
+      db.close();
+    }
+    const heat = new Map(real.heatmap.map((d) => [d.d, d.m]));
+    const today = dayKey(Date.now());
+    const gaps = eventDays.filter((key) => heat.has(key) && key !== today && (heat.get(key) ?? 0) <= 0);
+    check('真实库：有窗口数据的每一天热力都不为 0（不断档，今天除外）', gaps.length === 0,
+      `${eventDays.length} 天有窗口数据，其中热力为 0 的 ${gaps.length} 天：${gaps.slice(0, 3).join(',')}`);
   }
 } finally {
   rmSync(workDir, { recursive: true, force: true });

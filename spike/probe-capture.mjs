@@ -1,18 +1,19 @@
 // Spike probe: exercise the v1.1.1 self-capture pipeline without DSH.
 // Run: node spike/probe-capture.mjs
 //
-// 全部用 os.tmpdir() 里的临时库，绝不碰真实 dataDir 的 capture.db。三段：
+// 全部用 os.tmpdir() 里的临时库，绝不碰真实 dataDir 的 capture.db。四段：
 //   A. 合并语义（确定性地喂样本，不启真实采集器）
 //   B. 真实采集器（spawn powershell，采样若干轮 → 落库 → dispose → 无残留进程）
 //   C. stdout 编码（中文标题不能变乱码）
+//   D. 全量迁移 AW 历史（只读 AW 库文件的副本；没装 AW 就 SKIP）
 import { DatabaseSync } from 'node:sqlite';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, copyFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
-  startCollector, appendSample, captureStatus, openCaptureDb,
+  startCollector, appendSample, captureStatus, openCaptureDb, importHistory, readOwnActivity,
 } from '../plugin/index.js';
 
 const results = [];
@@ -275,6 +276,105 @@ try {
   }
   const afterCleanup = await collectorProcesses();
   check('C4 全程结束后没有残留采集进程', afterCleanup.length === 0, afterCleanup.join(','));
+
+  /* ---------------------------------------------- D. 迁移 AW 历史 */
+
+  console.log('\n--- D. 全量迁移 ActivityWatch 历史 ---');
+  // AW 库位置一律推导，不写死路径
+  const awSource = join(process.env.LOCALAPPDATA ?? '', 'activitywatch', 'activitywatch',
+    'aw-server', 'peewee-sqlite.v2.db');
+  if (!existsSync(awSource)) {
+    console.log(`SKIP  D* 这台机器没有 AW 库（${awSource}），跳过迁移断言`);
+  } else {
+    // 先自己数一遍 AW 到底有多少行（复制副本，别读正在被写的原库）
+    const awCopy = join(workDir, 'aw-copy.db');
+    for (const suffix of ['', '-wal', '-shm']) {
+      if (existsSync(awSource + suffix)) copyFileSync(awSource + suffix, awCopy + suffix);
+    }
+    const awDb = new DatabaseSync(awCopy, { readOnly: true });
+    const awEventCount = Number(awDb.prepare('SELECT COUNT(*) AS n FROM eventmodel').get().n);
+    const awBuckets = awDb.prepare('SELECT id, type FROM bucketmodel').all();
+    const awZeroDurations = Number(awDb.prepare('SELECT COUNT(*) AS n FROM eventmodel WHERE duration = 0').get().n);
+    const awTimestamps = awDb.prepare('SELECT timestamp AS ts FROM eventmodel').all();
+    awDb.close();
+    console.log(`AW 库：${awBuckets.length} 个 bucket / ${awEventCount} 条事件`);
+
+    const migrateDb = join(workDir, 'migrate.db');
+    const leftoversBefore = readdirSync(tmpdir()).filter((name) => name.startsWith('lifehud-aw-'));
+    const t0 = Date.now();
+    const stats = importHistory({ captureDb: migrateDb, dataDir: workDir });
+    const migrateMs = Date.now() - t0;
+    console.log(`迁移：${JSON.stringify(stats)}  ${migrateMs}ms`);
+
+    check('D1 迁移成功', stats.skipped === '', stats.skipped);
+    check('D2 bucket 全部迁入（含空的 general.stopwatch）',
+      readRows(migrateDb, 'SELECT id, type FROM buckets').length === awBuckets.length
+      && readRows(migrateDb, "SELECT id FROM buckets WHERE type = 'general.stopwatch'").length === 1,
+      readRows(migrateDb, 'SELECT id FROM buckets').map((b) => b.id).join(', '));
+    const migrated = readRows(migrateDb, 'SELECT COUNT(*) AS n FROM events')[0].n;
+    check('D3 事件数与 AW 一致（一条都不丢）', migrated === awEventCount, `${migrated} / AW ${awEventCount}`);
+    check('D4 duration=0 的心跳也保留',
+      readRows(migrateDb, 'SELECT COUNT(*) AS n FROM events WHERE duration = 0')[0].n === awZeroDurations,
+      `${readRows(migrateDb, 'SELECT COUNT(*) AS n FROM events WHERE duration = 0')[0].n} / AW ${awZeroDurations}`);
+    check('D5 源码标记 source=aw-migrated',
+      readRows(migrateDb, "SELECT COUNT(*) AS n FROM events WHERE source <> 'aw-migrated'")[0].n === 0);
+    check('D6 两条流都在（window 万级 / afk 数百）',
+      readRows(migrateDb, "SELECT COUNT(*) AS n FROM events e JOIN buckets b ON b.id = e.bucket_id WHERE b.type = 'currentwindow'")[0].n > 10000
+      && readRows(migrateDb, "SELECT COUNT(*) AS n FROM events e JOIN buckets b ON b.id = e.bucket_id WHERE b.type = 'afkstatus'")[0].n > 500,
+      'currentwindow + afkstatus');
+
+    const meta = new Map(readRows(migrateDb, 'SELECT key, value FROM meta').map((m) => [m.key, m.value]));
+    check('D7 history_imported = 1', meta.get('history_imported') === '1', String(meta.get('history_imported')));
+    let classes = null;
+    try { classes = JSON.parse(String(meta.get('aw_classes'))); } catch { /* 下面的断言会报 */ }
+    check('D8 meta.aw_classes 是 AW 的完整 classes 数组',
+      Array.isArray(classes) && classes.length > 0 && Array.isArray(classes[0]?.name),
+      `${classes?.length ?? 0} 条`);
+
+    const rawRow = readRows(migrateDb,
+      "SELECT e.data FROM events e JOIN buckets b ON b.id = e.bucket_id WHERE b.type = 'currentwindow' LIMIT 1")[0];
+    let rawParses = false;
+    try { JSON.parse(rawRow?.data); rawParses = true; } catch { /* 下面的断言会报 */ }
+    check('D9 data 存的是 datastr 原文（空格、字段都保留）',
+      typeof rawRow?.data === 'string' && rawRow.data.includes('"app": "') && rawParses, rawRow?.data);
+    check('D10 ts 全部是 ISO8601 UTC',
+      readRows(migrateDb, "SELECT ts FROM events WHERE ts NOT LIKE '____-__-__T__:__:__.___Z' LIMIT 1").length === 0);
+
+    const before = readRows(migrateDb, 'SELECT COUNT(*) AS n FROM events')[0].n;
+    const again = importHistory({ captureDb: migrateDb, dataDir: workDir });
+    const after = readRows(migrateDb, 'SELECT COUNT(*) AS n FROM events')[0].n;
+    check('D11 二次导入不新增行（幂等）', again.skipped === 'already' && before === after,
+      `${again.skipped}：${before} → ${after}`);
+
+    const leftoversAfter = readdirSync(tmpdir()).filter((name) => name.startsWith('lifehud-aw-'));
+    check('D12 迁移临时副本已清理（tmpdir 里没留垃圾）',
+      leftoversAfter.length === leftoversBefore.length,
+      leftoversBefore.length === 0 ? '无残留' : leftoversAfter.join(','));
+
+    // 迁移后的数据要能直接画出专注卡与热力日历（不断档）
+    const activity = readOwnActivity({ captureDb: migrateDb, dataDir: workDir }, 84);
+    const heat = new Map(activity.heatmap.map((d) => [d.d, d.m]));
+    const busyDays = activity.heatmap.filter((d) => d.m > 0).length;
+    check('D13 迁移后专注卡可用', activity.focus.available === true);
+    check('D14 迁移后 top 非空', (activity.focus.top ?? []).length > 0,
+      (activity.focus.top ?? []).slice(0, 3).map((a) => `${a.app} ${a.minutes}`).join(' · '));
+
+    // AW 里有数据的每一天，热力日历都不该是 0（断档 = 迁移丢了数据）
+    const localDay = (ms) => {
+      const d = new Date(ms);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    const awDays = [...new Set(awTimestamps
+      .map((row) => Date.parse(row.ts))
+      .filter((ms) => Number.isFinite(ms))
+      .map(localDay))].filter((key) => heat.has(key));
+    // 今天不算：它只是刚刚开始的一段（采集到的几分钟可能都是空转），不能算「断档」。
+    const todayKey = localDay(Date.now());
+    const gaps = awDays.filter((key) => key !== todayKey && (heat.get(key) ?? 0) <= 0);
+    check('D15 AW 有数据的每一天热力都不为 0（不断档）', gaps.length === 0,
+      `AW 覆盖 ${awDays.length} 天（${awDays[0]} → ${awDays.at(-1)}），热力有数据 ${busyDays} 天，`
+      + `空 ${gaps.length} 天：${gaps.slice(0, 3).join(',')}`);
+  }
 } finally {
   if (disposer) disposer();
   if (!keep) rmSync(workDir, { recursive: true, force: true });

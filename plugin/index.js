@@ -21,12 +21,13 @@
 import { DatabaseSync } from 'node:sqlite';
 import {
   readFileSync, readdirSync, writeFileSync, unlinkSync, existsSync, mkdirSync,
+  copyFileSync, mkdtempSync, rmSync,
 } from 'node:fs';
 import { createHash, randomBytes } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { homedir, hostname } from 'node:os';
+import { homedir, hostname, tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 
 const API_PREFIX = '/lifehud/api';
@@ -1047,6 +1048,197 @@ export function captureStatus() {
   return status;
 }
 
+/* --------------------------------------------- ActivityWatch 历史一次性迁移 */
+
+/**
+ * ActivityWatch 的 peewee 库默认位置。
+ * 仓库里不写绝对路径：`%LOCALAPPDATA%` 本来就在用户目录下。
+ * @returns {string} path
+ */
+function defaultHistorySource() {
+  return envPath(process.env.LOCALAPPDATA ?? '', 'activitywatch', 'activitywatch',
+    'aw-server', 'peewee-sqlite.v2.db');
+}
+
+/**
+ * AW 的时间戳 → ISO8601 UTC。
+ *
+ * AW v0.14.1 事件里是 `2026-11-09 15:54:03.180000+00:00`（UTC 带偏移），
+ * 但 bucket 的 `created` 是无时区的本地时间（`2026-10-28T23:22:07.320077`）。
+ * 交给 `Date.parse`：带偏移按偏移算，不带偏移按本机时区算 —— 正好是我们要的口径。
+ * @param {unknown} value @returns {string|null} ISO8601 UTC 或 null
+ */
+function awTimestamp(value) {
+  const text = String(value ?? '').trim();
+  if (!text) return null;
+  const parsed = Date.parse(text);
+  if (Number.isFinite(parsed)) return new Date(parsed).toISOString();
+  // 兜底：少数版本用空格分隔时间，直接 date-time 解析更稳。
+  const alt = Date.parse(text.replace(' ', 'T'));
+  return Number.isFinite(alt) ? new Date(alt).toISOString() : null;
+}
+
+/** @param {object} db @param {string} key @returns {string} */
+function readCaptureMeta(db, key) {
+  try {
+    return String(db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? '');
+  } catch {
+    return '';
+  }
+}
+
+/** @param {object} db @param {string} key @param {string} value @returns {void} */
+function writeCaptureMeta(db, key, value) {
+  db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, String(value));
+}
+
+/**
+ * 一次性把 ActivityWatch 的历史全量搬进本地采集库（规格 §4.6）。
+ *
+ * 这是**唯一**还会碰 ActivityWatch 的地方，而且只读文件：迁完就能卸载 AW，
+ * 运行期零依赖。幂等 —— `meta.history_imported='1'` 之后直接跳过，重复调用不会
+ * 多出一行；`config.historyImport === 'never'` 时完全不迁。
+ *
+ * 为什么先复制副本再读：AW 用 WAL 写库，直接读正在被写的原库有风险；
+ * 复制 .db / -wal / -shm 到 tmpdir 里以只读方式打开，读完立刻删干净。
+ * @param {object} [config] bundle row config
+ * @returns {{skipped:string,buckets:number,events:number,duplicates:number,classes:number}} stats
+ */
+export function importHistory(config = {}) {
+  const stats = { skipped: '', buckets: 0, events: 0, duplicates: 0, classes: 0 };
+  if (config.historyImport === 'never') {
+    stats.skipped = 'disabled';
+    return stats;
+  }
+  const source = String(config.historySource ?? '') || defaultHistorySource();
+  if (!source || !existsSync(source)) {
+    // 没装过 AW（或已卸载）是很正常的事，不算错误、也不打扰用户。
+    stats.skipped = 'no-source';
+    return stats;
+  }
+
+  let db;
+  try {
+    db = openCaptureDb(captureDbPath(config));
+  } catch (error) {
+    noteCapture(`迁移：打不开采集库：${error instanceof Error ? error.message : String(error)}`);
+    stats.skipped = 'db-error';
+    return stats;
+  }
+
+  let tempDir = '';
+  try {
+    if (readCaptureMeta(db, 'history_imported') === '1') {
+      stats.skipped = 'already';
+      return stats;
+    }
+
+    // 1) 复制到临时目录（含 -wal / -shm），再以只读方式打开副本。
+    tempDir = mkdtempSync(join(tmpdir(), 'lifehud-aw-'));
+    const copyPath = join(tempDir, 'aw.db');
+    for (const suffix of ['', '-wal', '-shm']) {
+      const from = source + suffix;
+      if (existsSync(from)) copyFileSync(from, copyPath + suffix);
+    }
+
+    const aw = new DatabaseSync(copyPath, { readOnly: true });
+    let awBuckets;
+    let awEvents;
+    try {
+      awBuckets = aw.prepare(
+        'SELECT key, id, type, client, hostname, created FROM bucketmodel',
+      ).all();
+      // ⚠️ eventmodel.bucket_id 指向 bucketmodel.key（INTEGER），不是 bucketmodel.id（TEXT）。
+      // 用 id 文本去查会静默返回 0 行，所以这里必须 JOIN。
+      awEvents = aw.prepare(`
+        SELECT b.id AS bucket_id, e.timestamp AS ts, e.duration AS duration, e.datastr AS data
+          FROM eventmodel e JOIN bucketmodel b ON b.key = e.bucket_id
+         ORDER BY e.timestamp`).all();
+    } finally {
+      aw.close();
+    }
+
+    // 2) 分类规则（classes）：详情页做「分类汇总」的唯一依据，不归档就永久丢失。
+    let classes = null;
+    try {
+      const settings = JSON.parse(readFileSync(join(dirname(source), 'settings.json'), 'utf8'));
+      if (Array.isArray(settings?.classes)) classes = settings.classes;
+    } catch (error) {
+      noteCapture(`迁移：读不到 AW 的 settings.json（分类规则可能缺失）：${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    // 3) 写库。一个事务一次性写完，中途失败就整体回滚，不会留半套数据。
+    const insertBucket = db.prepare(
+      'INSERT OR IGNORE INTO buckets (id, type, client, hostname, created) VALUES (?, ?, ?, ?, ?)',
+    );
+    const insertEvent = db.prepare(
+      'INSERT INTO events (bucket_id, ts, duration, data, source) VALUES (?, ?, ?, ?, ?)',
+    );
+    // 同 bucket 同 ts 已经存在就不再写（重跑迁移 / 半途失败后再跑都不会重复）。
+    const existing = new Set(db.prepare(
+      "SELECT bucket_id, ts FROM events WHERE source = 'aw-migrated'",
+    ).all().map((row) => `${row.bucket_id}\u0000${row.ts}`));
+
+    db.exec('BEGIN');
+    try {
+      for (const bucket of awBuckets) {
+        const id = String(bucket.id ?? '');
+        if (!id) continue;
+        insertBucket.run(
+          id,
+          String(bucket.type ?? 'unknown'),
+          String(bucket.client ?? ''),
+          String(bucket.hostname ?? ''),
+          awTimestamp(bucket.created) ?? new Date().toISOString(),
+        );
+        stats.buckets += 1;
+      }
+      for (const event of awEvents) {
+        const bucketId = String(event.bucket_id ?? '');
+        const ts = awTimestamp(event.ts);
+        if (!bucketId || !ts) continue;
+        const key = `${bucketId}\u0000${ts}`;
+        if (existing.has(key)) {
+          stats.duplicates += 1;
+          continue;
+        }
+        // 注意：**不要**把本次插入的 key 加进 existing —— AW 里确实存在同 bucket
+        // 同 timestamp 的不同事件，加了会把它们当成重复丢掉（规格要求一个字段都不丢）。
+        // 幂等靠的是「重跑时 existing 里已经有这些行」。
+        // data 存 datastr **原文**：AW 里有几个字段就留几个字段。
+        insertEvent.run(
+          bucketId,
+          ts,
+          Math.max(0, Number(event.duration) || 0),
+          String(event.data ?? '{}'),
+          'aw-migrated',
+        );
+        stats.events += 1;
+      }
+      if (classes) {
+        writeCaptureMeta(db, 'aw_classes', JSON.stringify(classes));
+        stats.classes = classes.length;
+      }
+      writeCaptureMeta(db, 'history_imported', '1');
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* 事务可能已经不在了 */ }
+      throw error;
+    }
+    return stats;
+  } catch (error) {
+    // 迁移失败不能拖垮插件：只进诊断，专注卡退化成「没有历史」而已。
+    noteCapture(`迁移 ActivityWatch 历史失败：${error instanceof Error ? error.message : String(error)}`);
+    stats.skipped = 'error';
+    return stats;
+  } finally {
+    try { db?.close(); } catch { /* 已关闭 */ }
+    if (tempDir) {
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* 删不掉也只是临时垃圾 */ }
+    }
+  }
+}
+
 /* ---------------------------------------------------------- 体重（小米云） */
 
 /**
@@ -1730,8 +1922,19 @@ function applyInner(ctx, config) {
 
   // 自采集（v1.1.1）：本机 PowerShell 采样前台窗口 + 空闲状态，把合并后的事件写进
   // <dataDir>/capture.db。启动失败只进诊断，绝不影响页面本身起不来。
+  //
+  // 顺序很重要：**先迁移历史、再开实时采集**。迁移只在第一次（history_imported != '1'）
+  // 真正干活，所以两条数据的时间段天然不重叠；幂等也保证重复 apply 不会重复导入。
   try {
     ctx.effect(() => {
+      try {
+        const imported = importHistory({ ...config, dataDir });
+        if (imported.events > 0 || imported.skipped === 'error') {
+          ctx.logger?.info?.(`[lifehud] activity history: ${JSON.stringify(imported)}`);
+        }
+      } catch (error) {
+        noteCapture(`迁移未完成：${error instanceof Error ? error.message : String(error)}`);
+      }
       const stop = startCollector({ ...config, dataDir });
       return () => {
         try { stop(); } catch { /* 收尾失败不该阻塞卸载 */ }
