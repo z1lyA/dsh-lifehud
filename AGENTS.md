@@ -118,6 +118,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **capture.db 用 WAL**（`journal_mode=WAL` + `synchronous=NORMAL` + `busy_timeout=3000`）：写句柄常驻、页面每次请求另开只读连接，没有 WAL 会偶发 `SQLITE_BUSY`。代价是 `dataDir` 里会多出 `capture.db-wal` / `-shm`（`.gitignore` 已挡 `capture.db*`）。
 - **未闭合事件也要先落盘**：合并语义下"同一个应用 8 小时"只有一行，如果只在事件切换时才 INSERT，页面一小时内会一直是空的。做法是首个样本就 INSERT，之后每 `CAPTURE_FLUSH_MS`（60s）原地 `UPDATE duration`。
 - **迁移与实时采集的时序**：必须在 `startCollector()` **之前**跑 `importHistory()`，靠 `meta.history_imported='1'` 保证幂等；否则两段数据会重叠。
+- **「最近 24 小时」与热力日历必须同一套扣 AFK 口径**：`readOwnActivity()` 里 `seconds`（扣 AFK，给热力和过滤用）与 `inside`（24h 的 tracking/top/longest）曾经是两套口径，真机上出现过 `tracking=705.6` 而同日热力只有 `354` 分钟的自相矛盾（v1.1.0 从 AW 取数时就有的继承缺陷，2026-11-10 验收抓到，commit `69a3f02` 已修）。现在 24h 用 `inside = overlap * (seconds / duration)`。改这里先跑 `node spike/probe-focus.mjs`。
 - **AW 停了以后别指望它回来**：本机 2026-11-10 按验收要求停掉了 aw-qt / aw-server / aw-watcher-afk / aw-watcher-window，插件不再依赖它们（只迁移时读文件）。要恢复 AW 得用户自己启动。
 
 ## 7. 当前状态
@@ -150,12 +151,12 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
 ```
 
 - **写读分离**：采集只由 Host 后台做，页面请求只读本地库，不触发采集、不联网。
-- **AFK**：`idle ≥ afkThresholdSeconds`（默认 180）记为 `afk` 区间，聚合时从每个窗口事件里扣掉；另外 `explorer.exe + Program Manager` 一律丢弃（锁屏/桌面焦点）。
+- **AFK**：`idle ≥ afkThresholdSeconds`（默认 180）记为 `afk` 区间。聚合时**窗口时长一律扣掉 AFK**：热力按扣后秒数算，24h 的 `tracking/top/longest` 按 `overlap × 活跃占比` 算（同一个比例，别写成两套口径）；`explorer.exe + Program Manager` 一律丢弃（锁屏/桌面焦点）。
 - **迁移**：首次启动 `importHistory()` → 复制 AW 库副本（含 `-wal`/`-shm`）到 tmpdir → 只读打开 → 全部 bucket + `events.data` 原样 + `settings.json` 的 `classes` 进 `meta.aw_classes` → `meta.history_imported='1'`（幂等）。**迁完就可以卸载 AW**。
 - **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]`，卡片显示「还没有采集到数据」，HUD 其余部分照常。
 - **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, rows, pending, restarts, pollSeconds, lastSampleAt, lastError, warnings[]}`；采集器 stderr / 退出码 / 迁移失败都会进 `warnings`（设置 → 诊断区可见）。
 - **改它的入口**：`plugin/collector.ps1`（采样）、`startCollector/appendSample/flushCapture`（合并与落盘）、`readOwnActivity`（聚合）、`importHistory`（迁移）。
-- **验证**：`node spike/probe-capture.mjs`（45 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等）、`node spike/probe-hud.mjs`（确定性 20 项）、`node spike/probe-hud.mjs --real`（真实库 23 项）。
+- **验证**：`node spike/probe-capture.mjs`（45 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等）、`node spike/probe-hud.mjs`（确定性 20 项）、`node spike/probe-hud.mjs --real`（真实库 23 项）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP）。
 
 ### 体重卡怎么工作（v1.1.0，重要）
 

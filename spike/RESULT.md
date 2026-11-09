@@ -165,11 +165,24 @@ DELETE /lifehud/api/photo   → 移除
 | 幂等 | 二次 `importHistory()` → `skipped:'already'`，0 新增行 |
 | 实时采集 | `capture: {running:true, pollSeconds:2, samples 递增, restarts:0, noise:0}`；10 秒内 15 → 20 个样本 |
 | 聚合性能 | 19,992 行时 `readOwnActivity()` **68 ms**（84 天 + AFK 扣除 + 24h 聚合全算完） |
-| 断 AW 后 | `/lifehud/api/hud` 的 `focus.available=true`、`top` 6 个真实应用、`warnings: []`、热力 13 天非零（与 AW 时代的 13 天一致，无断档） |
+| 断 AW 后 | `/lifehud/api/hud` 的 `focus.available=true`、`trackingMinutes=354.1`（= 同日热力 354 分钟，同一口径）、`top` 6 个真实应用、`warnings: []`、热力 13 天非零（与 AW 时代的 13 天一致，无断档） |
 | 库体积 | 迁移 19,129 条后 `capture.db` ≈ 5.4 MB（WAL 模式） |
 
-### 值得记住的发现
+### 验收发现的一个真 Bug（已修，commit 69a3f02）
 
+**现象**：`readOwnActivity()` 算出了「扣掉 AFK 的活动秒数」，却只用它算热力日历和「整段 AFK 就丢弃」；
+`trackingMinutes` / `top[].minutes` / `longest.minutes` 用的是**原始时长**。同一函数两套口径 → 真库上
+`trackingMinutes=705.6`，而**同一天热力只有 354 分钟**，自相矛盾；top 排序也被扭曲
+（`todesk 145.5min` 排在第二，扣掉 AFK 后其实掉出前六）。这个坑 v1.1.0 从 AW 取数时就有，属于继承缺陷。
+
+**修法**：`const activeRatio = seconds / duration;`，24h 那一段用 `inside = overlap * activeRatio`。
+AFK 区间不精确切分到事件内部，按占比摊到整段——**热力与 24h 用同一个比例**，不会再打架。
+
+**修后实测**：`trackingMinutes=354.1`（= 同日热力 354）、top = DeepSeek Harness 110.2 / 哔哩哔哩 87.4 / 微信 57.6 / Edge 20.1 / NowTree 18.8 / VS Code 17.4，与验收者（verify-hud）独立写的交叠算法复算逐项一致。
+`spike/probe-hud.mjs` 里写死旧口径的三条期望（90/135/90）已同步改成 60/105/60；
+新的独立探针 `spike/probe-focus.mjs` 专测这一条（C 组），修前 54/58、修后 48/48（含 1 项 SKIP）。
+
+### 值得记住的发现
 1. **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**。`WHERE bucket_id = '<aw bucket id>'` 会静默返回 0 行——只有 `JOIN bucketmodel b ON b.key = e.bucket_id` 才对。第一版迁移就是被这个坑到「以为 AW 里只有 0 条」。
 2. **AW 的时间戳是 `"2026-11-09 15:54:03.180000+00:00"`**（空格分隔 + 微秒 + 显式 UTC 偏移），`Date.parse` 能直接吃；别自己切字符串。
 3. **AW 里有 `duration: 0` 的心跳**（本机 5,764 条）。迁移要原样保留（一个字段都不丢），但**聚合时必须跳过**（`e.duration > 0`），否则会把应用时长摊薄。
@@ -192,4 +205,9 @@ DELETE /lifehud/api/photo   → 移除
 - **浏览器渲染**（卡片三种状态、5 分钟自动刷新、深浅主题）由页面验收，不在 probe 覆盖范围。
 - **锁屏**：`GetLastInputInfo` 只反映当前会话，与 AW v0.14.1 行为一致；锁屏时前台通常变成 `explorer.exe + Program Manager`，已被过滤。
 - **7×24 采集不做**：DSH 没运行的时间段没有数据。
+- **不落 `idle_seconds`**：样本里的空闲秒数**不进** `events.data`。原因是合并语义靠 `data` 完全相同才延长事件，
+  把逐样本变化的 `idle_seconds` 写进去等于每条样本都开新事件（8 小时一个应用会变成 14,400 行）。将来做「AFK 比例」用 AFK 流算即可。
+- **`capture.rows` 是「写入次数」不是「库行数」**（未闭合事件每 60s 会 UPDATE 一次），诊断用够，别当行数读。
+- **AW 历史里有一条病态事件**：`msedge` 单条 25.1 小时（AW 当年停摆造成）。迁移忠实保留（一个字段不丢），但它会压低 11-07 / 11-08 的热力；详情页做统计时应给单条事件设上限。
+- **HMR 顺序边界**：若某个宿主先激活新 ctx、后 dispose 旧 ctx，旧 disposer 可能把采集器停掉（`stopCapture` 只停自己那一个 state，但同一模块实例下两次 `apply` 共享单例）。实测 `remove → install` 两次都正常；正常升级不受影响。
 
