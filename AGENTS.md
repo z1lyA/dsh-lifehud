@@ -201,9 +201,15 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
    `git reset --soft <上一个已推送的提交>` → 按「功能 / 测试 / 文档」三类重新 `git commit`，再 `git tag -f` 指回新提交。
    注意：只有在**未 push** 时才能这么干；压完用 `git diff <旧HEAD> HEAD --stat`（应为空）证明内容零变化。
 
-## 11. 发布 / 开源前自查
+## 11. 仓库分工与发布前自查
 
-这个仓库要能被别人跑起来、又不能带出作者的个人信息，所以发布前跑：
+**这个仓库就是代码主仓库**：日常开发、提交、推送到这里（`origin` = `z1lyA/dsh-lifehud`，公开）。
+
+私人内容**不放这里**——调研笔记、心智记录、带真实作息/体型的文档、布局原型探索，放：
+- 本地私有仓库 `dsh-lifehud-private`（保留完整开发历史与私人笔记），或
+- 你本地不纳管 git 的目录（`~/.dsh/lifehud` 这类运行时数据本来就在仓库外）。
+
+发布 / 提交前跑一次自查：
 
 ```bash
 node spike/prepublish-check.mjs      # 扫 PII：绝对路径 / 用户名 / 邮箱 / 设备号 / 会话文件
@@ -215,9 +221,9 @@ node spike/prepublish-check.mjs      # 扫 PII：绝对路径 / 用户名 / 邮�
 - 文档里写路径一律用 `%APPDATA%` / `%LOCALAPPDATA%` / `~` / `<仓库>` 这类占位，不写某台机器的绝对路径；
 - 代码里的默认值必须是**推导**出来的（`process.env.APPDATA`、`homedir()`），不是写死的；
 - 不把任何人的设备号（`blt.3.*`）、账号 id、token 写进代码或文档；
-- commit 身份用 GitHub noreply 邮箱，别用真实邮箱：
-  `git config user.email "<你的数字 id>+<用户名>@users.noreply.github.com"`。
+- **commit 身份必须是 GitHub 匿名邮箱**（noreply），别用真实邮箱：
+  `git config user.email "<数字 id>+<用户名>@users.noreply.github.com"`。
 
-> 历史也公开的话，光清工作树没用。这个仓库就是用**一个初始 commit** 发布的：
-> 作者的私有仓库留完整开发历史，公开仓库只保留干净的起点。
+> 这个仓库的历史是从**一条初始 commit** 开始的：作者早期的私有历史留在 `dsh-lifehud-private` 里，
+> 所以公开的 commit 里没有旧邮箱、旧路径。
 
