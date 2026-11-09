@@ -11,9 +11,10 @@
  *   POST   /lifehud/api/settings  → merge settings
  *
  * Data sources are all read-only: NowTree's SQLite, NowTree's slot bounds in
- * WebView2 localStorage, DSH's session projection cache, ActivityWatch's local
- * REST API on 127.0.0.1:5600, and Xiaomi's cloud device-data endpoint (read
- * only; the only thing LifeHud writes back is its own SQLite mirror).
+ * WebView2 localStorage, DSH's session projection cache, Xiaomi's cloud
+ * device-data endpoint. 专注/热力不再联网也不再依赖任何外部进程：自己的
+ * collector.ps1 采样 Windows 前台窗口与空闲状态，写进 <dataDir>/capture.db，
+ * 页面只读这个本地库（LifeHud 唯一自己写的地方）。
  *
  * @module dsh-lifehud
  */
@@ -35,7 +36,7 @@ const PHOTO_PATH = `${API_PREFIX}/photo`;
 const SETTINGS_PATH = `${API_PREFIX}/settings`;
 const SESSION_EXISTS_PATH = `${API_PREFIX}/session-exists`;
 
-/** Built-in friendly names for the apps ActivityWatch sees as `<name>.exe`. */
+/** Built-in friendly names for the apps the collector sees as `<name>.exe`. */
 const DEFAULT_APP_ALIASES = {
   'explorer.exe': '文件资源管理器',
   msedge: 'Edge',
@@ -66,12 +67,12 @@ const DEFAULT_APP_ALIASES = {
 };
 
 /**
- * Turn an ActivityWatch `app` into something readable.
+ * Turn a raw `app` (exe name) into something readable.
  *
- * AW reports the executable name (`Weixin.exe`, `msedge`), which is not how the
- * user thinks about their software. Resolution order: user aliases (config) →
- * built-in aliases → exe name with the extension stripped.
- * @param {string} raw raw app name from AW
+ * The collector reports the executable name (`Weixin.exe`, `msedge`), which is not
+ * how the user thinks about their software. Resolution order: user aliases (config)
+ * → built-in aliases → exe name with the extension stripped.
+ * @param {string} raw raw app name from the capture DB
  * @param {Record<string,string>} aliases user aliases
  * @returns {string} display name
  */
@@ -89,7 +90,6 @@ function appDisplayName(raw, aliases = {}) {
 const DEFAULT_BOUNDS = { morningStart: 6, noonStart: 13, eveningStart: 18 };
 const SLOT_LABEL = { morning: '早', noon: '午', evening: '晚', rest: '休息' };
 const WEATHER_TTL_MS = 10 * 60 * 1000;
-const ACTIVITY_TTL_MS = 10 * 60 * 1000;
 
 /* ---- 自采集（前台窗口 + AFK）常量，见下面「自采集」一节 ---- */
 /** 本地采集库文件名：`<dataDir>/capture.db`（`config.captureDb` 可整段覆盖）。 */
@@ -431,64 +431,96 @@ function readSessions(projDir, limit, dshHome) {
 }
 
 /**
- * ActivityWatch: today's app focus **and** an 84-day daily heatmap.
+ * AFK 区间索引：算「一段时间里有多少秒不是 AFK」。
  *
- * One wide pull (≈15k events / 2.5 MB / ~1.2 s) is cheaper than two narrow ones,
- * so both cards share it and it is cached. AFK intervals are subtracted from
- * every window event — otherwise idle time (explorer.exe / "Program Manager")
- * dominates and every day looks like 20 productive hours.
- * @param {string} base aw-server base url
- * @param {number} days how many days of history to aggregate
- * @returns {Promise<{focus:object,heatmap:object[]}>} activity payload
+ * 窗口事件本来就是按时间升序扫的，所以游标只前进、不回退：整体 O(窗口数 + AFK 数)，
+ * 不是每条事件都把 AFK 全扫一遍。84 天两万条事件下也就几毫秒。
+ * @param {Array<[number, number]>} spans AFK 区间（起止毫秒）
+ * @returns {(startMs:number, endMs:number) => number} 活跃秒数
  */
-async function fetchActivity(base, aliases = {}, days = 84) {
-  const buckets = await (await fetch(`${base}/api/0/buckets/`, { signal: AbortSignal.timeout(4000) })).json();
-  const ids = Object.keys(buckets ?? {});
-  const winId = ids.find((id) => id.startsWith('aw-watcher-window_'));
-  const afkId = ids.find((id) => id.startsWith('aw-watcher-afk_'));
-  if (!winId) throw new Error('ActivityWatch: no window bucket');
-
-  const now = new Date();
-  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  const rangeStart = new Date(dayStart.getTime() - (days - 1) * 86400000);
-  const iso = (d) => d.toISOString().slice(0, 19);
-  const q = `?start=${iso(rangeStart)}&end=${iso(now)}&limit=200000`;
-
-  const winEvents = await (await fetch(`${base}/api/0/buckets/${encodeURIComponent(winId)}/events${q}`, {
-    signal: AbortSignal.timeout(15000),
-  })).json();
-
-  /** AFK intervals in epoch ms. */
-  const afkSpans = [];
-  if (afkId) {
-    try {
-      const afkEvents = await (await fetch(`${base}/api/0/buckets/${encodeURIComponent(afkId)}/events${q}`, {
-        signal: AbortSignal.timeout(8000),
-      })).json();
-      for (const ev of Array.isArray(afkEvents) ? afkEvents : []) {
-        if (String(ev.data?.status) !== 'afk') continue;
-        const s = Date.parse(ev.timestamp);
-        if (!Number.isFinite(s)) continue;
-        afkSpans.push([s, s + (Number(ev.duration) || 0) * 1000]);
-      }
-    } catch { /* AFK optional */ }
-  }
-
-  /**
-   * Seconds of [startMs, endMs) not covered by AFK.
-   * @param {number} startMs @param {number} endMs @returns {number} active seconds
-   */
-  const activeOverlap = (startMs, endMs) => {
+function createAfkIndex(spans) {
+  const sorted = spans.slice().sort((a, b) => a[0] - b[0]);
+  let cursor = 0;
+  return (startMs, endMs) => {
+    while (cursor < sorted.length && sorted[cursor][1] <= startMs) cursor += 1;
     let idle = 0;
-    for (const [as, ae] of afkSpans) {
-      const lo = Math.max(startMs, as);
-      const hi = Math.min(endMs, ae);
+    for (let i = cursor; i < sorted.length && sorted[i][0] < endMs; i += 1) {
+      const lo = Math.max(startMs, sorted[i][0]);
+      const hi = Math.min(endMs, sorted[i][1]);
       if (hi > lo) idle += hi - lo;
     }
     return Math.max(0, (endMs - startMs) / 1000 - idle / 1000);
   };
+}
 
-  /** Local date key `YYYY-MM-DD`. */
+/**
+ * 本地采集库 → 专注卡的两个数据块：最近 24 小时的应用时长 + 84 天每日活跃分钟。
+ *
+ * 返回值与 v1.1.0 从 ActivityWatch 取数时**完全同构**（客户端一行都不用改）：
+ *   { focus: { available, window: '24h', trackingMinutes, top: [{app, minutes}],
+ *              longest: {app, title, minutes} },
+ *     heatmap: [{ d, m }] }
+ *
+ * 两条流在这里合并：window 事件的时长要**扣掉 AFK 区间**，否则锁屏/挂机会把
+ * explorer.exe 顶到第一（旧实现踩过这个坑）。迁移来的 AW bucket 与自采集 bucket
+ * 都靠 `buckets.type` 覆盖，不用区分 `source`。
+ *
+ * 每请求开关一次只读连接（不长期持有写句柄）。
+ * @param {object} [config] bundle row config
+ * @param {number} [days] 热力日历天数
+ * @param {Record<string,string>} [aliases] 应用别名
+ * @returns {{focus:object, heatmap:object[]}} activity payload
+ */
+export function readOwnActivity(config = {}, days = 84, aliases = {}) {
+  const dbPath = captureDbPath(config);
+  if (!existsSync(dbPath)) {
+    throw new Error(`本地采集库还没有建立（${CAPTURE_FILE} 会在第一次采样后生成）`);
+  }
+
+  const now = new Date();
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const rangeStart = new Date(dayStart.getTime() - (days - 1) * 86400000);
+  const rangeStartIso = rangeStart.toISOString();
+
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  let winRows;
+  let afkRows;
+  try {
+    // 采集器（写句柄）随时可能落盘，只读连接也要给 busy_timeout，别一撞锁就报错。
+    db.exec('PRAGMA busy_timeout = 3000');
+    // duration <= 0 的行是 AW 里没被合并的心跳，保留在库里但不参与聚合，
+    // 否则它们会把 top 的应用时长摊薄。
+    winRows = db.prepare(`
+      SELECT e.ts AS ts, e.duration AS duration, e.data AS data
+        FROM events e JOIN buckets b ON b.id = e.bucket_id
+       WHERE b.type = 'currentwindow' AND e.ts >= ? AND e.duration > 0
+       ORDER BY e.ts`).all(rangeStartIso);
+    afkRows = db.prepare(`
+      SELECT e.ts AS ts, e.duration AS duration, e.data AS data
+        FROM events e JOIN buckets b ON b.id = e.bucket_id
+       WHERE b.type = 'afkstatus' AND e.ts >= ? AND e.duration > 0
+       ORDER BY e.ts`).all(rangeStartIso);
+  } finally {
+    db.close();
+  }
+
+  /** AFK 区间（毫秒）。data 是原始 JSON，形状由采集器/迁移决定，必须自己解析。 */
+  const afkSpans = [];
+  for (const row of afkRows) {
+    let data;
+    try {
+      data = JSON.parse(row.data);
+    } catch {
+      continue;
+    }
+    if (String(data?.status) !== 'afk') continue;
+    const start = Date.parse(row.ts);
+    if (!Number.isFinite(start)) continue;
+    afkSpans.push([start, start + Math.max(0, Number(row.duration) || 0) * 1000]);
+  }
+  const activeSeconds = createAfkIndex(afkSpans);
+
+  /** 本地日期键 `YYYY-MM-DD`。 */
   const dayKey = (ms) => {
     const d = new Date(ms);
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -498,42 +530,48 @@ async function fetchActivity(base, aliases = {}, days = 84) {
   const recentByApp = new Map();
   let recentSeconds = 0;
   let longest = { app: '', title: '', seconds: 0 };
-  const todayKey = dayKey(now.getTime());
-  // The focus card shows a ROLLING 24 h window: "today" alone makes every evening
-  // look empty because the morning has scrolled out of the day.
+  let considered = 0;
+  // 专注卡看的是**滚动 24 小时**：只算「今天」的话，一到晚上早上那段滚出去，
+  // 卡片就会显得空。
   const since24 = now.getTime() - 24 * 3600 * 1000;
 
-  for (const ev of Array.isArray(winEvents) ? winEvents : []) {
-    const startMs = Date.parse(ev.timestamp);
-    const duration = Number(ev.duration) || 0;
+  for (const row of winRows) {
+    const startMs = Date.parse(row.ts);
+    const duration = Number(row.duration) || 0;
     if (!Number.isFinite(startMs) || duration <= 0) continue;
-    const seconds = afkSpans.length > 0
-      ? activeOverlap(startMs, startMs + duration * 1000)
-      : duration;
-    if (seconds < 1) continue;
 
-    // Lock screen / desktop focus reports as explorer.exe + "Program Manager" and is
-    // not real work. AFK alone does not catch it (the watcher can be paused or the
-    // machine locked rather than idle), so drop the obvious idle bucket.
-    const appName = String(ev.data?.app ?? '未知');
-    const titleName = String(ev.data?.title ?? '');
-    if (/^explorer\.exe$/i.test(appName) && /program manager/i.test(titleName)) continue;
-
-    perDay.set(dayKey(startMs), (perDay.get(dayKey(startMs)) ?? 0) + seconds);
+    let data;
+    try {
+      data = JSON.parse(row.data);
+    } catch {
+      continue;
+    }
 
     const endMs = startMs + duration * 1000;
+    const seconds = afkSpans.length > 0 ? activeSeconds(startMs, endMs) : duration;
+    if (seconds < 1) continue;
+
+    // 锁屏 / 桌面焦点在窗口流里是 explorer.exe + "Program Manager"，不是真实工作。
+    // 光靠 AFK 抓不住（机器可能被锁屏而不是空闲），所以把这个明显的空转段丢掉。
+    const appName = String(data?.app ?? '未知');
+    const titleName = String(data?.title ?? '');
+    if (/^explorer\.exe$/i.test(appName) && /program manager/i.test(titleName)) continue;
+
+    considered += 1;
+    perDay.set(dayKey(startMs), (perDay.get(dayKey(startMs)) ?? 0) + seconds);
+
     if (endMs < since24) continue;
-    // Clip the part that falls inside the window.
+    // 只算落在 24 小时窗口里的那一段。
     const inside = Math.max(0, (Math.min(endMs, now.getTime()) - Math.max(startMs, since24)) / 1000);
     if (inside < 1) continue;
-    const app = appName;
     recentSeconds += inside;
-    recentByApp.set(app, (recentByApp.get(app) ?? 0) + inside);
+    recentByApp.set(appName, (recentByApp.get(appName) ?? 0) + inside);
     if (inside > longest.seconds) {
-      longest = { app, title: titleName, seconds: inside };
+      longest = { app: appName, title: titleName, seconds: inside };
     }
   }
 
+  // 固定 84 天、升序、一天不缺：热力日历靠这个「没有断档」才有意义。
   const heatmap = [];
   for (let i = days - 1; i >= 0; i -= 1) {
     const key = dayKey(dayStart.getTime() - i * 86400000);
@@ -547,7 +585,8 @@ async function fetchActivity(base, aliases = {}, days = 84) {
 
   return {
     focus: {
-      available: true,
+      // 一条窗口事件都没有（刚装、还没采到）就是「没数据」，别假装可用。
+      available: considered > 0,
       window: '24h',
       trackingMinutes: Math.round(recentSeconds / 6) / 10,
       top,
@@ -559,20 +598,6 @@ async function fetchActivity(base, aliases = {}, days = 84) {
     },
     heatmap,
   };
-}
-
-/** @type {{at:number,value:{focus:object,heatmap:object[]}}|null} */
-let activityCache = null;
-
-/**
- * Cached ActivityWatch payload (10 min).
- * @param {string} base @returns {Promise<{focus:object,heatmap:object[]}>} activity
- */
-async function readActivity(base, aliases = {}) {
-  if (activityCache && Date.now() - activityCache.at < ACTIVITY_TTL_MS) return activityCache.value;
-  const value = await fetchActivity(base, aliases);
-  activityCache = { at: Date.now(), value };
-  return value;
 }
 
 /* ------------------------------------------------- 自采集（前台窗口 + AFK） */
@@ -659,6 +684,11 @@ function captureDbPath(config = {}) {
 export function openCaptureDb(dbPath) {
   mkdirSync(dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
+  // WAL：写（采集器）与读（/hud 每次开只读连接）不必互相等，迁移大批写入时页面也不卡。
+  // busy_timeout 兜住偶发的锁竞争（默认几乎等于不等）。
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA synchronous = NORMAL');
+  db.exec('PRAGMA busy_timeout = 3000');
   db.exec(CAPTURE_SCHEMA);
   db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run('schema_version', CAPTURE_SCHEMA_VERSION);
   db.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run('hostname', hostname());
@@ -704,6 +734,9 @@ export function appendSample(row) {
 
   state.samples += 1;
   state.lastSampleAt = tsMs;
+  // 有样本 = 采集器活着。每帧清零重启计数，免得「睡眠唤醒偶发崩几次」攒到上限后
+  // 就永久停采（否则跑几周就会被 5 次历史崩溃拖死）。
+  state.restarts = 0;
 
   const app = String(row?.app ?? '') || 'unknown';
   // 窗口标题可能很敏感：storeTitles:false 时只留应用名（决策 D3）。
@@ -1552,7 +1585,6 @@ export async function buildHud(config = {}, runtime = {}) {
   const leveldbDir = String(config.leveldbDir ?? '') || defaultLeveldbDir();
   const dshHome = String(config.dshHome ?? join(homedir(), '.dsh'));
   const sessionLimit = Number(config.sessionLimit ?? 5);
-  const awBase = String(config.activityWatchUrl ?? 'http://127.0.0.1:5600');
   const lat = Number(settings.latitude ?? config.latitude ?? 39.9042);
   const lon = Number(settings.longitude ?? config.longitude ?? 116.4074);
 
@@ -1562,13 +1594,17 @@ export async function buildHud(config = {}, runtime = {}) {
 
   const warnings = [...captureWarnings];
 
+  // 专注卡改读本地采集库（v1.1.1）：这里不再有 ActivityWatch 请求。
+  // 采集库没建立 / 读库出错都只是「没有数据」，不能让整个 HUD 挂掉。
+  const aliases = settings.appAliases ?? config.appAliases ?? {};
   const failActivity = (error) => {
     warnings.push(`activity: ${error instanceof Error ? error.message : String(error)}`);
-    return activityCache?.value ?? { focus: { available: false }, heatmap: [] };
+    return { focus: { available: false, window: '24h', trackingMinutes: 0, top: [], longest: { app: '', title: '', minutes: 0 } }, heatmap: [] };
   };
 
   const [activity, weather, sessions] = await Promise.all([
-    readActivity(awBase, settings.appAliases ?? config.appAliases ?? {}).catch(failActivity),
+    // readOwnActivity 是同步的：包一层 Promise 才能和另外两路并发、也才能接住同步抛错。
+    Promise.resolve().then(() => readOwnActivity(config, 84, aliases)).catch(failActivity),
     readWeather(lat, lon).catch((error) => {
       warnings.push(`weather: ${error instanceof Error ? error.message : String(error)}`);
       return weatherCache?.value ?? null;
@@ -1602,6 +1638,9 @@ export async function buildHud(config = {}, runtime = {}) {
     sessions,
     focus: activity.focus,
     heatmap: activity.heatmap,
+    // 采集器自己的状态（是否在跑 / 收到多少样本 / 最后一次错误），
+    // 给页面诊断区用。只加字段，不改既有契约。
+    capture: captureStatus(),
     warnings,
   };
 }
