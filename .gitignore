@@ -1,0 +1,30 @@
+# 依赖
+node_modules/
+pnpm-lock.yaml
+
+# 探查过程产物：从 DSH 的 app.asar 里抽出的第三方源码，不适合公开
+spike/tmp/
+spike/tmp2/
+spike/tmp3.js
+research/evidence/
+
+# 个人内容：心智记录不进仓库（research/ 是调研笔记，私有仓库里保留备份，
+# 但发布用的公开快照不包含 research/——见 AGENTS.md §11）
+mind/
+
+# 本机运行时状态（LifeHud 自己的可写产物，永远不该提交）
+mi-session.json
+lifehud-weight.db
+lifehud-weight.db-*
+lifehud-settings.json
+lifehud-photo.bin
+lifehud-photo.json
+*.local.yml
+.env
+.env.*
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

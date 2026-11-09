@@ -1,0 +1,32 @@
+# lifehud bundle patch: one Host row. The browser half ships through
+# package.json's dsh.client declaration and exports["./client"].
+#
+# ⚠️ 这个文件里**故意没有任何绝对路径**：能推导的都在代码里推导了（见 plugin/index.js 顶部
+#   的默认路径一节），所以新装机通常一行都不用改。真要覆盖时再解除对应注释。
+- insert:
+    - id: lifehud
+      name: dsh-lifehud
+      config:
+        # 以下四项都有默认值，按需覆盖（默认值是「同一台机器上的标准位置」）：
+        #   nowtreeDb   → %APPDATA%\com.nowtree.app\nowtree.sqlite
+        #   leveldbDir  → %LOCALAPPDATA%\com.nowtree.app\EBWebView\Default\Local Storage\leveldb
+        #   dataDir     → ~/.dsh/lifehud（LifeHud 自己的可写状态都在这）
+        #   weightDb    → <dataDir>/lifehud-weight.db
+        #
+        # 小米云会话文件默认读 <dataDir>/mi-session.json（不进 git，格式见 docs/小米云取数.md）。
+        # 体脂秤的设备号不用填：插件会从账号设备列表里自动找（结果缓存在体重库的 meta 里）。
+        #
+        # nowtreeDb: 'C:\Users\<你>\AppData\Roaming\com.nowtree.app\nowtree.sqlite'
+        # leveldbDir: 'C:\Users\<你>\AppData\Local\com.nowtree.app\EBWebView\Default\Local Storage\leveldb'
+        # dataDir: 'C:\Users\<你>\.dsh\lifehud'
+        # miSession: 'C:\某个不放进 git 的目录\mi-session.json'
+        # miDid: 'blt.3.<你的设备>'      # 只有自动发现失败时才需要
+        # weightTtlMs: 600000            # 体重同步 TTL，默认 10 分钟
+
+        # ActivityWatch aw-server（本地 REST API），一般不用改。
+        activityWatchUrl: 'http://127.0.0.1:5600'
+        # 天气默认坐标；页面「设置 → 使用我的位置」会覆盖它。
+        latitude: 39.9042
+        longitude: 116.4074
+        # 「最近会话」卡显示几条。
+        sessionLimit: 5
