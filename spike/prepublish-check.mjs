@@ -11,8 +11,8 @@ const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /** 只看这些后缀（其余是二进制/锁文件，没有可比对的意义）。 */
 const TEXT_EXT = new Set(['.md', '.mjs', '.js', '.json', '.yml', '.yaml', '.txt', '.html', '.svg', '.css']);
-/** 这些目录不参与发布，不检查。 */
-const SKIP_DIRS = new Set(['node_modules', '.git', 'spike/tmp', 'spike/tmp2', 'research', 'mind']);
+/** 这些目录不参与发布，不检查。`notes/` 是作者本地笔记（已在 .gitignore 里）。 */
+const SKIP_DIRS = new Set(['node_modules', '.git', 'spike/tmp', 'spike/tmp2', 'research', 'mind', 'notes']);
 
 /** 命中即 FAIL 的模式。`allow` 用来放行占位符（例如 `C:\Users\<你>\…`、`blt.3.xxxxxxxx`）。 */
 const RULES = [

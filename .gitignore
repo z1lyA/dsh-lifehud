@@ -2,15 +2,17 @@
 node_modules/
 pnpm-lock.yaml
 
+# 私人笔记：本地可见、永不提交（调研笔记 / 心智记录 / 私人文档都在 notes/ 里）
+notes/
+
+# 旧位置兼容（万一又在根目录建了 research/ mind/，同样不进库）
+research/
+mind/
+
 # 探查过程产物：从 DSH 的 app.asar 里抽出的第三方源码，不适合公开
 spike/tmp/
 spike/tmp2/
 spike/tmp3.js
-research/evidence/
-
-# 个人内容：心智记录不进仓库（research/ 是调研笔记，私有仓库里保留备份，
-# 但发布用的公开快照不包含 research/——见 AGENTS.md §11）
-mind/
 
 # 本机运行时状态（LifeHud 自己的可写产物，永远不该提交）
 mi-session.json
