@@ -24,7 +24,7 @@ if (!window.__lifehudClientRegistered) {
       const PANEL_ID = 'lifehud';
       const NS = 'lifehud';
       /** 客户端构建标记：改这里 → 页面上能一眼看出加载的是哪一版。 */
-      const BUILD = '1.1.0';
+      const BUILD = '1.1.1';
       const HUD_URL = '/lifehud/api/hud';
       const WEIGHT_URL = '/lifehud/api/weight';
       const PHOTO_URL = '/lifehud/api/photo';

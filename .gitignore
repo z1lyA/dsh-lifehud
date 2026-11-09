@@ -18,6 +18,8 @@ spike/tmp3.js
 mi-session.json
 lifehud-weight.db
 lifehud-weight.db-*
+capture.db
+capture.db-*
 lifehud-settings.json
 lifehud-photo.bin
 lifehud-photo.json
