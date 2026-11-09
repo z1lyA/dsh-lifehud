@@ -1040,6 +1040,9 @@ export function captureStatus() {
     rows: state?.rows ?? 0,
     pending: state?.pending.length ?? 0,
     restarts: state?.restarts ?? 0,
+    // 采集器 stdout 里解析不出来的行数（正常应为 0；不为 0 说明 PowerShell 往 stdout
+    // 掺了别的东西，比如 Warning 流）。
+    noise: state?.noise ?? 0,
     pollSeconds: state?.pollSeconds ?? null,
     lastSampleAt: state?.lastSampleAt ? new Date(state.lastSampleAt).toISOString() : null,
     lastError: state?.lastError || null,
