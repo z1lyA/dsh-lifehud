@@ -5,6 +5,23 @@
 
 ---
 
+## 0. 三十秒上手
+
+| 我要… | 怎么做 |
+|---|---|
+| 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
+| 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡）、`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项） |
+| 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
+| 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
+| 看踩过的坑 | 本文件 §6 + `spike/RESULT.md` |
+
+**仓库身份**：`z1lyA/dsh-lifehud`（**公开、唯一仓库**，`origin` 指向它）。本机目录名 `dsh-lifehud`；插件注册的是 `link:<仓库>/plugin`。
+
+**阅读顺序**：本文件 → `README.md`（对外说明）→ `docs/小米云取数.md`（体重链路细节）→ `spike/RESULT.md`（历史结论与验证记录）。
+
+---
+
 ## 1. 这是什么
 
 **LifeHud** 是长在 DeepSeek Harness（DSH）里的个人工作台：一块「抬头就能看见」的页面。
@@ -201,15 +218,18 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
    `git reset --soft <上一个已推送的提交>` → 按「功能 / 测试 / 文档」三类重新 `git commit`，再 `git tag -f` 指回新提交。
    注意：只有在**未 push** 时才能这么干；压完用 `git diff <旧HEAD> HEAD --stat`（应为空）证明内容零变化。
 
-## 11. 仓库分工与发布前自查
+## 11. 只有一个仓库 + 发布前自查
 
-**这个仓库就是代码主仓库**：日常开发、提交、推送到这里（`origin` = `z1lyA/dsh-lifehud`，公开）。
+**只有这一个仓库**（`z1lyA/dsh-lifehud`，公开）：开发、提交、推送都在这儿，没有"公开版 / 私有版"两套需要同步。
 
-私人内容**不放这里**——调研笔记、心智记录、带真实作息/体型的文档、布局原型探索，放：
-- 本地私有仓库 `dsh-lifehud-private`（保留完整开发历史与私人笔记），或
-- 你本地不纳管 git 的目录（`~/.dsh/lifehud` 这类运行时数据本来就在仓库外）。
+私人内容**不进任何 git 仓库**，只留本机：
 
-发布 / 提交前跑一次自查：
+| 类型 | 放哪 | 说明 |
+|---|---|---|
+| 调研笔记、心智记录、布局原型、写真实作息/体型的文档 | 仓库**外面**的普通文件夹（作者习惯放在与仓库同级的位置） | 不 `git init`、不建远程，纯本地 |
+| 运行时私人数据（`mi-session.json`、体重库、设置、相框） | `~/.dsh/lifehud`（仓库外） | 插件自己读写，`.gitignore` 也挡了同名文件 |
+
+所以对本仓库的唯一要求是：**别把上面两类东西 commit 进来**。提交前跑一次：
 
 ```bash
 node spike/prepublish-check.mjs      # 扫 PII：绝对路径 / 用户名 / 邮箱 / 设备号 / 会话文件
@@ -221,9 +241,9 @@ node spike/prepublish-check.mjs      # 扫 PII：绝对路径 / 用户名 / 邮�
 - 文档里写路径一律用 `%APPDATA%` / `%LOCALAPPDATA%` / `~` / `<仓库>` 这类占位，不写某台机器的绝对路径；
 - 代码里的默认值必须是**推导**出来的（`process.env.APPDATA`、`homedir()`），不是写死的；
 - 不把任何人的设备号（`blt.3.*`）、账号 id、token 写进代码或文档；
-- **commit 身份必须是 GitHub 匿名邮箱**（noreply），别用真实邮箱：
+- **commit 身份用 GitHub 匿名邮箱**（noreply），别用真实邮箱：
   `git config user.email "<数字 id>+<用户名>@users.noreply.github.com"`。
 
-> 这个仓库的历史是从**一条初始 commit** 开始的：作者早期的私有历史留在 `dsh-lifehud-private` 里，
-> 所以公开的 commit 里没有旧邮箱、旧路径。
+> 这个仓库的历史从**一条初始 commit** 开始（2026-11-09 首次公开）：更早的开发历史没有随仓库发布，
+> 所以公开的 commit 里不存在旧邮箱、旧路径。
 
