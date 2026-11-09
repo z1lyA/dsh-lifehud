@@ -17,6 +17,23 @@ import {
 } from '../plugin/index.js';
 
 const results = [];
+
+/** 本探针自己起过的采集器 pid（判「有没有残留」只认自己起的，别人同时跑探针不算）。 */
+const spawnedPids = new Set();
+
+/** @param {string[]} list @returns {string[]} 只留下本探针起过的 pid */
+function oursOnly(list) {
+  return list.filter((pid) => spawnedPids.has(Number(pid)));
+}
+
+/** 起采集器并把 pid 记进 spawnedPids。 */
+function startTracked(config) {
+  const dispose = startCollector(config);
+  const pid = captureStatus().pid;
+  if (Number.isFinite(pid)) spawnedPids.add(Number(pid));
+  return { dispose, pid };
+}
+
 /** @param {string} name @param {boolean} pass @param {string} [detail] */
 function check(name, pass, detail = '') {
   results.push({ name, pass, detail });
@@ -98,7 +115,7 @@ try {
   process.env.WINDIR = join(workDir, 'no-such-windir');
   const mergeDb = join(workDir, 'merge.db');
   try {
-    disposer = startCollector({ captureDb: mergeDb, capturePollSeconds: 2, afkThresholdSeconds: 180 });
+    disposer = startTracked({ captureDb: mergeDb, capturePollSeconds: 2, afkThresholdSeconds: 180 }).dispose;
     await sleep(300);
 
     const status = captureStatus();
@@ -161,7 +178,7 @@ try {
 
   // storeTitles:false 时不落标题
   const muteDb = join(workDir, 'mute.db');
-  const muteStop = startCollector({ captureDb: muteDb, storeTitles: false });
+  const muteStop = startTracked({ captureDb: muteDb, storeTitles: false }).dispose;
   appendSample({
     timestamp: new Date('2026-01-02T00:00:00.000Z').toISOString(),
     app: 'Code.exe', title: '机密文件.txt', idle_seconds: 0, status: 'not-afk',
@@ -174,11 +191,13 @@ try {
 
   console.log('\n--- B. 真实采集器（spawn powershell，跑几轮采样）---');
   const liveDb = join(workDir, 'live.db');
-  const leftoversBefore = await collectorProcesses();
-  check('B1 启动前没有孤儿采集进程', leftoversBefore.length === 0, leftoversBefore.join(','));
+  // 别的 agent 可能同时在跑同一个探针，所以「残留」只认**本探针自己起过**的 pid，
+  // 别人的采集器只打印出来当背景信息，不算失败。
+  const foreign = await collectorProcesses();
+  check('B1 启动前本探针没有挂着的采集器', captureStatus().running === false,
+    foreign.length > 0 ? `（同名进程 ${foreign.join(',')} 是别人的，忽略）` : '');
 
-  const stop = startCollector({ captureDb: liveDb, capturePollSeconds: 1, afkThresholdSeconds: 180 });
-  const pid = captureStatus().pid;
+  const { dispose: stop, pid } = startTracked({ captureDb: liveDb, capturePollSeconds: 1, afkThresholdSeconds: 180 });
   check('B2 采集器进程起来了', Number.isFinite(pid) && pid > 0, `pid=${pid}`);
 
   const deadline = Date.now() + 25000;
@@ -211,7 +230,7 @@ try {
   let gone = [];
   const killDeadline = Date.now() + 6000;
   do {
-    gone = await collectorProcesses();
+    gone = oursOnly(await collectorProcesses());
     if (gone.length === 0) break;
     await sleep(300);
   } while (Date.now() < killDeadline);
@@ -253,7 +272,7 @@ try {
   await sleep(2500);
 
   const probeDb = join(workDir, 'cjk.db');
-  const cjkStop = startCollector({ captureDb: probeDb, capturePollSeconds: 1 });
+  const cjkStop = startTracked({ captureDb: probeDb, capturePollSeconds: 1 }).dispose;
   await sleep(4000);
   cjkStop();
   const cjkRows = readEvents(probeDb).filter((r) => r.bucket_id.startsWith('lifehud-window_'));
@@ -274,7 +293,7 @@ try {
     await runPowerShell(['-Command',
       `Get-Process -Id ${pid} -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue`]);
   }
-  const afterCleanup = await collectorProcesses();
+  const afterCleanup = oursOnly(await collectorProcesses());
   check('C4 全程结束后没有残留采集进程', afterCleanup.length === 0, afterCleanup.join(','));
 
   /* ---------------------------------------------- D. 迁移 AW 历史 */
