@@ -209,11 +209,14 @@ try {
     return `${snap.points.length} 个点：${tableRows(snap.points)}`;
   });
 
-  await check('1.3', '云上的条数与本地库一致（archived vs COUNT(*)>distinctDates 的关系）', async () => {
+  await check('1.3', '本地镜像 ⊇ 云端本次返回的条数（云端可能只回时间窗内的记录）', async () => {
     const stats = dbStats(REAL_DB);
-    assert(stats.rows === syncedSnapshot.archived,
-      `archived=${syncedSnapshot.archived} 但本地 ${stats.rows} 行（同 weight_id 幂等时两者应相等）`);
-    return `archived=${syncedSnapshot.archived} = 本地 ${stats.rows} 行 / ${stats.distinctDates} 个测量日（多次称重合并成一天）`;
+    // 小米云不是「全量历史库」：实测云端只回最近 43 条，而本地镜像保留了 47 行。
+    // 镜像的设计就是「只增不删」，所以断言是包含关系，不是相等。
+    assert(stats.rows >= syncedSnapshot.archived,
+      `本地 ${stats.rows} 行 < 云端本次 ${syncedSnapshot.archived} 条（镜像不该丢云端已有的记录）`);
+    return `云端本次 ${syncedSnapshot.archived} 条 ⊆ 本地镜像 ${stats.rows} 行 / ${stats.distinctDates} 个测量日`
+      + `（云端只回时间窗内的记录，本地保留历史）`;
   });
 
   // ════════════════ 2. 落库正确 ════════════════

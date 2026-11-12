@@ -248,6 +248,10 @@ try {
 
   check('buildHud 返回里带 capture 状态字段', Boolean(payload.capture)
     && typeof payload.capture.running === 'boolean' && Array.isArray(payload.capture.warnings));
+  check('buildHud 返回里带 idle 空闲强度（没有 idle 流时降级为 4 个 0）',
+    Array.isArray(payload.idle?.levels) && payload.idle.levels.length === 4
+    && payload.idle.levels.every((l) => l.minutes === 0),
+    JSON.stringify(payload.idle));
   check('采集库里没有 opens 的写句柄（readOwnActivity 用只读连接）', (() => {
     const db = new DatabaseSync(bulkDb, { readOnly: true });
     try {

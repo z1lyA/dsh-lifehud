@@ -152,8 +152,13 @@ try {
   const mergeRows = readEvents(mergeDb);
   const winRows = mergeRows.filter((r) => r.bucket_id.startsWith('lifehud-window_'));
   const afkRows = mergeRows.filter((r) => r.bucket_id.startsWith('lifehud-afk_'));
-  check('A3 两条流各有 bucket 行', winRows.length > 0 && afkRows.length > 0,
-    `window ${winRows.length} 行 / afk ${afkRows.length} 行`);
+  const idleRows = mergeRows.filter((r) => r.bucket_id.startsWith('lifehud-idle_'));
+  check('A3 三条流各有 bucket 行（window / afk / idle）',
+    winRows.length > 0 && afkRows.length > 0 && idleRows.length > 0,
+    `window ${winRows.length} 行 / afk ${afkRows.length} 行 / idle ${idleRows.length} 行`);
+  check('A3b idle 流只存离散档位（合并语义不被逐样本数值破坏）',
+    idleRows.every((r) => ['0-10', '10-60', '60-180', '180+'].includes(JSON.parse(r.data).level)),
+    idleRows.map((r) => r.data).join(' '));
   // 31 条 window 样本 → 3 段（Code 段、间隔断开后的 msedge 段、AFK 样本切出的新段）
   check('A4 连续同应用被合并成 1 段', winRows.length === 3, `${winRows.length} 段（31 条样本）`);
   const first = winRows[0];
@@ -169,7 +174,8 @@ try {
     `${mergeRows.length} 行 / 32 条样本`);
 
   const bucketRows = readRows(mergeDb, 'SELECT id, type, client, hostname FROM buckets ORDER BY id');
-  check('A11 两个自采集 bucket 都在', bucketRows.length === 2,
+  check('A11 三个自采集 bucket 都在（window / afk / idle）', bucketRows.length === 3
+    && ['currentwindow', 'afkstatus', 'idle'].every((t) => bucketRows.some((b) => b.type === t)),
     bucketRows.map((b) => `${b.id}(${b.type})`).join(', '));
   const metaRows = readRows(mergeDb, 'SELECT key, value FROM meta');
   check('A12 meta 有 schema_version', metaRows.some((m) => m.key === 'schema_version' && m.value === '2'));
@@ -315,6 +321,11 @@ try {
     const awBuckets = awDb.prepare('SELECT id, type FROM bucketmodel').all();
     const awZeroDurations = Number(awDb.prepare('SELECT COUNT(*) AS n FROM eventmodel WHERE duration = 0').get().n);
     const awTimestamps = awDb.prepare('SELECT timestamp AS ts FROM eventmodel').all();
+    // D15 用：AW 窗口流里「真正有工作」的事件（排除 explorer/Program Manager 空转段）。
+    const awWindowRows = awDb.prepare(`
+      SELECT e.timestamp AS ts, e.duration AS duration, e.datastr AS data
+        FROM eventmodel e JOIN bucketmodel b ON b.key = e.bucket_id
+       WHERE b.type = 'currentwindow'`).all();
     awDb.close();
     console.log(`AW 库：${awBuckets.length} 个 bucket / ${awEventCount} 条事件`);
 
@@ -375,23 +386,49 @@ try {
     const heat = new Map(activity.heatmap.map((d) => [d.d, d.m]));
     const busyDays = activity.heatmap.filter((d) => d.m > 0).length;
     check('D13 迁移后专注卡可用', activity.focus.available === true);
-    check('D14 迁移后 top 非空', (activity.focus.top ?? []).length > 0,
-      (activity.focus.top ?? []).slice(0, 3).map((a) => `${a.app} ${a.minutes}`).join(' · '));
 
-    // AW 里有数据的每一天，热力日历都不该是 0（断档 = 迁移丢了数据）
+    // D14：top 是「最近 24 小时」。AW 已经停了几天时，迁移数据本来就不在窗口里，
+    // 这时该验的是「窗口内有数据时 top 非空」，而不是强求 top 永远非空。
+    const awLatestMs = Math.max(...awTimestamps.map((row) => Date.parse(row.ts)).filter(Number.isFinite));
+    const awInside24h = Number.isFinite(awLatestMs) && Date.now() - awLatestMs <= 24 * 3600 * 1000;
+    const top = activity.focus.top ?? [];
+    check('D14 迁移后 top 非空（AW 最后数据还在 24h 窗口内时）',
+      !awInside24h || top.length > 0,
+      awInside24h
+        ? top.slice(0, 3).map((a) => `${a.app} ${a.minutes}`).join(' · ')
+        : `跳过：AW 最后数据在 ${new Date(awLatestMs).toISOString()}，已超出 24h 窗口`);
+
+    // AW 里「有真实窗口工作」的每一天，热力日历都不该是 0（断档 = 迁移丢了数据）。
+    // 注意排除 explorer.exe + Program Manager（锁屏/桌面焦点会被聚合逻辑丢掉），
+    // 否则 AW 停摆前那几天的空转段会被误报成断档。
     const localDay = (ms) => {
       const d = new Date(ms);
       return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     };
-    const awDays = [...new Set(awTimestamps
-      .map((row) => Date.parse(row.ts))
-      .filter((ms) => Number.isFinite(ms))
-      .map(localDay))].filter((key) => heat.has(key));
+    const awWorkDays = new Map();
+    for (const row of awWindowRows) {
+      const seconds = Number(row.duration) || 0;
+      if (seconds <= 0) continue;
+      const ms = Date.parse(row.ts);
+      if (!Number.isFinite(ms)) continue;
+      let data = null;
+      try { data = JSON.parse(row.data); } catch { continue; }
+      const app = String(data?.app ?? '');
+      const title = String(data?.title ?? '');
+      if (/^explorer\.exe$/i.test(app) && /program manager/i.test(title)) continue;
+      const key = localDay(ms);
+      awWorkDays.set(key, (awWorkDays.get(key) ?? 0) + seconds);
+    }
+    // 热力是按分钟四舍五入的：某天只有几秒工作 → 0 分钟是正常取整，不是断档。
+    // 所以只要求「当天真实窗口工作 ≥ 60 秒」的日子热力非 0。
+    const coveredDays = [...awWorkDays.entries()]
+      .filter(([key, seconds]) => heat.has(key) && seconds >= 60)
+      .map(([key]) => key);
     // 今天不算：它只是刚刚开始的一段（采集到的几分钟可能都是空转），不能算「断档」。
     const todayKey = localDay(Date.now());
-    const gaps = awDays.filter((key) => key !== todayKey && (heat.get(key) ?? 0) <= 0);
-    check('D15 AW 有数据的每一天热力都不为 0（不断档）', gaps.length === 0,
-      `AW 覆盖 ${awDays.length} 天（${awDays[0]} → ${awDays.at(-1)}），热力有数据 ${busyDays} 天，`
+    const gaps = coveredDays.filter((key) => key !== todayKey && (heat.get(key) ?? 0) <= 0);
+    check('D15 AW 有真实窗口工作的每一天热力都不为 0（不断档）', gaps.length === 0,
+      `AW 有工作 ${coveredDays.length} 天（${coveredDays[0]} → ${coveredDays.at(-1)}），热力有数据 ${busyDays} 天，`
       + `空 ${gaps.length} 天：${gaps.slice(0, 3).join(',')}`);
   }
 } finally {

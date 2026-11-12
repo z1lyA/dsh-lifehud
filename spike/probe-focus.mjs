@@ -178,10 +178,11 @@ try {
     `AW ${migratedIds.size} 个 → 本库 ${presentMigrated.length} 个：${[...migratedIds].join(', ')}`);
 
   const liveBuckets = bucketRows.filter((b) => b.client === 'lifehud-capture');
-  check('A8 自采集的两个 bucket 也在（client=lifehud-capture）',
-    liveBuckets.length === 2
+  check('A8 自采集的三个 bucket 也在（window / afk / idle）',
+    liveBuckets.length === 3
     && liveBuckets.some((b) => b.type === 'currentwindow')
-    && liveBuckets.some((b) => b.type === 'afkstatus'),
+    && liveBuckets.some((b) => b.type === 'afkstatus')
+    && liveBuckets.some((b) => b.type === 'idle'),
     liveBuckets.map((b) => `${b.id}(${b.type})`).join(', '));
   check('A9 bucket 行字段完整（type/client/hostname/created 都非空）',
     bucketRows.every((b) => b.type && b.client && b.hostname && b.created),
@@ -538,6 +539,7 @@ try {
   const mergeEvents = rows(mergeDb, 'SELECT bucket_id, ts, duration, data FROM events ORDER BY ts');
   const winSeg = mergeEvents.filter((r) => r.bucket_id.startsWith('lifehud-window_'));
   const afkSeg = mergeEvents.filter((r) => r.bucket_id.startsWith('lifehud-afk_'));
+  const idleSeg = mergeEvents.filter((r) => r.bucket_id.startsWith('lifehud-idle_'));
   check('D6 同应用连续 118 秒合并成 1 行（不是 60 行）',
     winSeg.filter((r) => JSON.parse(r.data).app === 'Code.exe').length === 2,
     `Code 段 ${winSeg.filter((r) => JSON.parse(r.data).app === 'Code.exe').length} 行`
@@ -553,6 +555,12 @@ try {
   const compression = mergeEvents.length === 0 ? 0 : 80 / mergeEvents.length;
   check('D10 压缩率 ≥ 10 倍（80 条样本 → 个位数行）', compression >= 10,
     `80 / ${mergeEvents.length} = ${compression.toFixed(1)}×`);
+  check('D11 空闲流只存离散档位、并且也合并（不是每条样本一行）',
+    idleSeg.length > 0 && idleSeg.length <= 3
+    && idleSeg.every((r) => ['0-10', '10-60', '60-180', '180+'].includes(JSON.parse(r.data).level)),
+    `${idleSeg.length} 行；档位 ${[...new Set(idleSeg.map((r) => JSON.parse(r.data).level))].join(',')}`);
+  check('D12 空档位在切应用时仍连续合并（idle 流不跟着 app 断）',
+    idleSeg.length <= 2, `${idleSeg.length} 行（80 条样本里空闲档位一直没变）`);
 
   /* ======================================================= E. HTTP（给出 DSH 地址时） */
 
