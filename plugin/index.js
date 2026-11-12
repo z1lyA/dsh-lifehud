@@ -119,8 +119,6 @@ const WEIGHT_TTL_MS = 10 * 60 * 1000;
 const MAX_PHOTO_BYTES = 4 * 1024 * 1024;
 
 /* ---- 检查更新（只读 GitHub，手动触发）常量，见下面「检查更新」一节 ---- */
-/** 同一次检查结果缓存多久。页面只在用户点「检查更新」时才请求，TTL 只服务连点/重开设置。 */
-const UPDATE_TTL_MS = 6 * 60 * 60 * 1000;
 /** GitHub 请求超时（离线时别让按钮转圈太久）。 */
 const UPDATE_TIMEOUT_MS = 8 * 1000;
 /** 默认检查的仓库（fork 用 config.updateRepo 覆盖）。 */
@@ -796,6 +794,23 @@ function pushSegment(state, bucketId, data, tsMs) {
 }
 
 /**
+ * 写一段事件：没有 rowid 就 INSERT 并回填，有就 UPDATE duration。
+ * 闭合段与未闭合段走同一套分派（抽出来也让回滚清理只有一处）。
+ * @param {object} state 运行时
+ * @param {{rowId:number|null,bucketId:string,ts:string,duration:number,data:string}} row
+ * @returns {boolean} 是否本轮新 INSERT（回滚后要把 rowId 清掉）
+ */
+function writeSegmentRow(state, row) {
+  if (row.rowId == null) {
+    const result = state.insertStmt.run(row.bucketId, row.ts, row.duration, row.data, 'live');
+    row.rowId = Number(result.lastInsertRowid);
+    return true;
+  }
+  state.updateStmt.run(row.duration, row.rowId);
+  return false;
+}
+
+/**
  * 落盘。
  *
  * 未闭合事件也一起写：先 INSERT 拿到 rowid，之后每次 flush 原地 UPDATE duration。
@@ -804,30 +819,27 @@ function pushSegment(state, bucketId, data, tsMs) {
  * @param {object|null} [state] 运行时，默认当前单例
  * @returns {number} 本轮落盘的事件数（含 UPDATE，够诊断用）
  */
-function flushCapture(state = captureRuntime) {
+export function flushCapture(state = captureRuntime) {
   if (!state?.db) return 0;
   const closed = state.pending.splice(0, state.pending.length);
   const open = [...state.open.values()];
   if (closed.length === 0 && open.length === 0) return 0;
 
   let written = 0;
+  /** 本轮新 INSERT 的行；回滚后它们已经不存在，必须清掉 rowId（见 catch 里的说明）。 */
+  const inserted = [];
   try {
     state.db.exec('BEGIN');
     for (const row of closed) {
-      if (row.rowId == null) {
-        state.insertStmt.run(row.bucketId, row.ts, row.duration, row.data, 'live');
-      } else {
-        state.updateStmt.run(row.duration, row.rowId);
-      }
+      if (writeSegmentRow(state, row)) inserted.push({ row });
       written += 1;
     }
     for (const segment of open) {
       const row = settleSegment(segment);
-      if (row.rowId == null) {
-        const result = state.insertStmt.run(row.bucketId, row.ts, row.duration, row.data, 'live');
-        segment.rowId = Number(result.lastInsertRowid);
-      } else {
-        state.updateStmt.run(row.duration, row.rowId);
+      if (writeSegmentRow(state, row)) {
+        // 新插入的行 id 落在 segment 上：下一轮直接 UPDATE，不再 INSERT。
+        segment.rowId = row.rowId;
+        inserted.push({ row, segment });
       }
       written += 1;
     }
@@ -837,6 +849,12 @@ function flushCapture(state = captureRuntime) {
     return written;
   } catch (error) {
     try { state.db.exec('ROLLBACK'); } catch { /* 事务可能已经不在了 */ }
+    // 回滚后本轮 INSERT 的行已经不存在：不清 rowId，下一轮就会走 UPDATE 命中 0 行，
+    // 而 SQLite 不会报错 → 这一段静默丢失（专注/热力少算）。闭合行同理，放回队列前也要清。
+    for (const item of inserted) {
+      item.row.rowId = null;
+      if (item.segment) item.segment.rowId = null;
+    }
     // 没写成功的闭合事件放回队列，下一轮再试，别默默丢掉数据。
     if (closed.length > 0) state.pending.unshift(...closed);
     state.lastError = error instanceof Error ? error.message : String(error);
@@ -1843,8 +1861,8 @@ export function summarizeUpdate(current, latest) {
   };
 }
 
-/** 检查更新的结果缓存（只在内存里，不落盘；重启后第一次点按钮重新打一次网络）。 */
-const updateCache = { repo: '', at: 0, result: null };
+/** 检查更新的最近一次成功结果（只在内存里：失败时降级用它，不落盘）。 */
+const updateCache = { repo: '', result: null };
 /** 同一个仓库的并发检查共用一次请求（防连点）。 @type {Map<string,Promise<object>>} */
 const updateInflight = new Map();
 
@@ -1910,8 +1928,9 @@ function updateReasonOf(error) {
  * 404 时回退 `/tags`（本仓库当前只有 tag，没有 Release）。取最大语义版本，不取第一个。
  *
  * 失败从不抛给页面：返回上一次成功的结果并标 `stale:true`，从没成功过就返回 `latest:null`。
+ * 不做 TTL 缓存：唯一调用方是「手动点按钮」，点了就该真打一次；并发连点由单飞合并。
  * @param {object} [config] bundle row config
- * @param {{force?:boolean, fetchImpl?:typeof fetch}} [options]
+ * @param {{fetchImpl?:typeof fetch}} [options]
  * @returns {Promise<object>} snapshot
  */
 export async function readUpdate(config = {}, options = {}) {
@@ -1940,11 +1959,6 @@ export async function readUpdate(config = {}, options = {}) {
     return { ...base, reason: 'no-fetch' };
   }
   const fetchImpl = typeof options.fetchImpl === 'function' ? options.fetchImpl : fetch;
-  const ttl = Math.max(60000, Number(config.updateTtlMs ?? UPDATE_TTL_MS));
-  if (!options.force && updateCache.result && updateCache.result.repo === repo
-    && Date.now() - updateCache.at < ttl) {
-    return { ...updateCache.result, cached: true };
-  }
   if (updateInflight.has(repo)) return updateInflight.get(repo);
 
   const run = (async () => {
@@ -2004,7 +2018,6 @@ export async function readUpdate(config = {}, options = {}) {
         reason: latest ? null : 'no-tags',
       };
       updateCache.repo = repo;
-      updateCache.at = Date.now();
       updateCache.result = result;
       return result;
     } catch (error) {
@@ -2012,7 +2025,7 @@ export async function readUpdate(config = {}, options = {}) {
       const previous = updateCache.result && updateCache.result.repo === repo
         ? updateCache.result
         : null;
-      if (previous) return { ...previous, stale: true, cached: true, reason };
+      if (previous) return { ...previous, stale: true, reason };
       return { ...base, stale: true, reason };
     }
   })();
@@ -2327,11 +2340,7 @@ function applyInner(ctx, config) {
           sendJson(res, 403, { ok: false, error: 'local access only' });
           return;
         }
-        let force = false;
-        try {
-          force = new URL(String(req.url ?? ''), 'http://127.0.0.1').searchParams.get('force') === '1';
-        } catch { /* 非法 URL 就当普通请求 */ }
-        readUpdate(config, { force })
+        readUpdate(config)
           .then((snapshot) => sendJson(res, 200, snapshot))
           .catch((error) => sendJson(res, 500, {
             ok: false,

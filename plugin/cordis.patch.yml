@@ -24,10 +24,9 @@
         # weightTtlMs: 600000            # 体重同步 TTL，默认 10 分钟
 
         # 检查更新（v1.1.2）：只有页面「设置 → 检查更新」手动点按钮时才联网，
-        # 读公开仓库的 GitHub Release / Tag（不带任何本机信息，结果只缓存在内存里）。
+        # 读公开仓库的 GitHub Release / Tag（不带任何本机信息，Host 只在内存里留最近一次结果用于降级）。
         # updateCheck: true                # false = 完全禁用（路由返回 disabled，不发网络）
         # updateRepo: 'z1lyA/dsh-lifehud'  # fork 时改成自己的 owner/name
-        # updateTtlMs: 21600000            # 结果缓存 6 小时（连点按钮时才生效）
 
         # 专注卡自采集（v1.1.1 起不再依赖 ActivityWatch 进程）：本机 PowerShell 采样，
         # 不联网、不读其它应用的运行数据；数据只落 <dataDir>/capture.db。

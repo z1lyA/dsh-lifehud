@@ -24,7 +24,7 @@ if (!window.__lifehudClientRegistered) {
       const PANEL_ID = 'lifehud';
       const NS = 'lifehud';
       /** 客户端构建标记：改这里 → 页面上能一眼看出加载的是哪一版。 */
-      const BUILD = '1.1.1';
+      const BUILD = '1.1.2';
       const HUD_URL = '/lifehud/api/hud';
       const WEIGHT_URL = '/lifehud/api/weight';
       const PHOTO_URL = '/lifehud/api/photo';
@@ -153,10 +153,10 @@ if (!window.__lifehudClientRegistered) {
 
       /**
        * 设置里那行状态文案。优先级：失败 → 有新版 → 本地更新 → 已是最新 → 没查过。
-       * @param {object|null} u @param {string} hostVersion
+       * @param {object|null} u
        * @returns {string}
        */
-      function updateStatusText(u, hostVersion) {
+      function updateStatusText(u) {
         if (!u) return '未检查（点下面按钮查一次，只有手动点才会联网）';
         if (u.reason === 'disabled') return updateReasonText('disabled');
         if (!u.current) return '读不到本地版本（plugin/package.json 缺失或损坏）';
@@ -165,7 +165,8 @@ if (!window.__lifehudClientRegistered) {
           return `${updateReasonText(u.reason)}${tail}`;
         }
         if (u.hasUpdate) {
-          return `发现新版本 v${u.latest}（当前 v${u.current || hostVersion}）`;
+          const when = u.publishedAt ? `，${new Date(u.publishedAt).toLocaleDateString('zh-CN')} 发布` : '';
+          return `发现新版本 v${u.latest}${when}（当前 v${u.current}）`;
         }
         if (u.ahead) return `本地 v${u.current} 比远端新（这个版本还没发布）`;
         if (u.latest) return `已是最新 v${u.latest}`;
@@ -1095,8 +1096,18 @@ if (!window.__lifehudClientRegistered) {
                 + (props.version && props.version !== BUILD ? '（页面资源还是旧的，按 Ctrl+R 刷新）' : '')),
               // 状态行：失败原因 / 有新版本 / 本地更新 / 已是最新 / 没查过，都由 Host 的字段决定，
               // 页面不做二次推断（ahead 就是 ahead，不冒充「有新版本」）。
-              h('div', { key: 'st', style: { ...S.dim, lineHeight: 1.8 } }, updateStatusText(props.update, props.version || BUILD)),
+              h('div', { key: 'st', style: { ...S.dim, lineHeight: 1.8 } }, updateStatusText(props.update)),
               h('div', { key: 'ck', style: S.dim }, updateCheckedText(props.update)),
+              // Release 正文（有 Release 才有；没有就是空串，不占位）。
+              props.update?.notes
+                ? h('div', {
+                  key: 'notes',
+                  style: {
+                    ...S.dim, marginTop: 8, lineHeight: 1.65, whiteSpace: 'pre-wrap',
+                    maxHeight: 96, overflow: 'hidden',
+                  },
+                }, props.update.notes)
+                : null,
               h('div', { key: 'acts', style: { display: 'flex', gap: 10, alignItems: 'center', marginTop: 10, flexWrap: 'wrap' } }, [
                 h('button', {
                   key: 'b', type: 'button',
@@ -1159,14 +1170,14 @@ if (!window.__lifehudClientRegistered) {
           }, []);
 
           /**
-           * 手动检查更新：`?force=1` 跳过 Host 的 6 小时缓存，点了就真打一次 GitHub。
+           * 手动检查更新：点了就真打一次 GitHub（Host 不做 TTL 缓存，只做并发单飞）。
            * 结果同时进 state 与 localStorage；失败也只提示，不影响页面其它部分。
            */
           const checkUpdate = React.useCallback(async () => {
             if (updateBusy) return;
             setUpdateBusy(true);
             try {
-              const res = await fetch(`${UPDATE_URL}?force=1`, { headers: { accept: 'application/json' } });
+              const res = await fetch(UPDATE_URL, { headers: { accept: 'application/json' } });
               if (!res.ok) throw new Error(`HTTP ${res.status}`);
               const snapshot = await res.json();
               setUpdateState(snapshot);
