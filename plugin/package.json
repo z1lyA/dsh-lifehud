@@ -11,7 +11,8 @@
     "index.js",
     "client.js",
     "collector.ps1",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "lib"
   ],
   "dsh": {
     "bundle": {
