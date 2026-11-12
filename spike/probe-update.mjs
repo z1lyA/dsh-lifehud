@@ -16,7 +16,9 @@ import { readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { parseVersion, compareVersion, summarizeUpdate, readUpdate } from '../plugin/index.js';
+import {
+  parseVersion, compareVersion, summarizeUpdate, readUpdate, UPDATE_REASON_CODES,
+} from '../plugin/index.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = dirname(HERE);
@@ -174,6 +176,12 @@ function sectionB() {
     await check('B2 client.js 的 BUILD 与 package.json 一致', () => {
       eq(CLIENT_BUILD, PKG_VERSION, 'client BUILD');
       return `client BUILD = ${CLIENT_BUILD}`;
+    });
+    await check('B3 client.js 的 reason 翻译表覆盖 Host 导出的码表', () => {
+      const source = readFileSync(join(REPO, 'plugin', 'client.js'), 'utf8');
+      const missing = UPDATE_REASON_CODES.filter((code) => !new RegExp(`['"]?${code}['"]?\\s*:`).test(source));
+      eq(missing.join(','), '', 'client 缺少翻译的 reason');
+      return `${UPDATE_REASON_CODES.length} 个码全部有中文翻译（新增码漏同步会在这里红）`;
     });
   })();
 }

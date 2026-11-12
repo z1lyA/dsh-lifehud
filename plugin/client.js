@@ -1301,10 +1301,24 @@ if (!window.__lifehudClientRegistered) {
 
           // 专注卡：三种状态 —— 关掉了 / 有数据 / 还没采到。
           // 空态文案不再提 ActivityWatch：数据已改成本机自采集，那个名字对用户只是噪音。
+          // 「最长」原来是没人用的死字段；现在渲染在条形图下面（app 已由 Host 套过别名，与 top 一致）。
           const focusCard = h(Card, { key: 'focus', title: '专注 · 最近 24 小时' },
             focusOn
               ? (focus?.available
-                ? h(BarRows, { items: focus.top, limit: 5 })
+                ? h('div', { key: 'body', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } }, [
+                  h('div', { key: 'bars', style: { flex: '1 1 auto', minHeight: 0 } },
+                    h(BarRows, { items: focus.top, limit: 5 })),
+                  focus.longest?.app && focus.longest?.minutes > 0
+                    ? h('div', {
+                      key: 'longest',
+                      style: {
+                        ...S.dim, flex: 'none', marginTop: 8, overflow: 'hidden',
+                        textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      },
+                      title: focus.longest.title || undefined,
+                    }, `最长：${focus.longest.app} · ${Math.round(focus.longest.minutes)} 分钟`)
+                    : null,
+                ])
                 : h('div', { key: 'e', style: S.empty }, '还没有采集到数据'))
               : h('div', { key: 'off', style: S.empty }, '已关闭'));
 

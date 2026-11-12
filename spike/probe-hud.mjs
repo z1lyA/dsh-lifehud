@@ -200,8 +200,8 @@ try {
   check('duration=0 的事件不参与聚合', !(focus.top ?? []).some((a) => /cmd/i.test(a.app)));
   // 60（Code：90 分钟扣 30 分钟 AFK）+ 40（Edge）+ 5（微信）= 105；空转段与 duration=0 都不算进来。
   check('trackingMinutes = 105（60+40+5，AFK 已扣）', focus.trackingMinutes === 105, String(focus.trackingMinutes));
-  check('longest 用原始 app 名、60 分钟（同上扣 AFK）',
-    focus.longest?.app === 'Code.exe' && focus.longest?.minutes === 60
+  check('longest 用显示名（别名）、60 分钟（同上扣 AFK）',
+    focus.longest?.app === 'VS Code' && focus.longest?.minutes === 60
     && focus.longest?.title === 'index.js - VS Code', JSON.stringify(focus.longest));
 
   check('heatmap 恰好 84 天', payload.heatmap.length === 84, String(payload.heatmap.length));

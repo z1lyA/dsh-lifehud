@@ -127,6 +127,15 @@ const UPDATE_REPO_DEFAULT = 'z1lyA/dsh-lifehud';
 const UPDATE_NOTES_MAX = 400;
 /** tags 接口一次取多少个（够覆盖最近的发版；取其中最大的语义版本）。 */
 const UPDATE_TAGS_PER_PAGE = 30;
+/**
+ * 检查更新可能返回的 reason 码。
+ * 页面（client.js）负责翻译成中文，浏览器 bundle 没法 import Host 常量，
+ * 所以这里导出一份清单，由 `spike/probe-update.mjs` 断言两边键集一致。
+ */
+export const UPDATE_REASON_CODES = Object.freeze([
+  'disabled', 'no-fetch', 'network', 'timeout', 'rate-limited',
+  'not-found', 'bad-payload', 'bad-repo', 'no-tags',
+]);
 
 /** 小米云端点（细节见 docs/小米云取数.md）。设备号不再写死，见 resolveMiDid()。 */
 const MI_BASE = 'https://api.io.mi.com/app';
@@ -467,6 +476,38 @@ function createAfkIndex(spans) {
 }
 
 /**
+ * 解析 `events.data` 原文；坏 JSON 返回 null。
+ * 窗口流与 AFK 流都要解析同一列，抽出来免得两处各写一遍 try/catch。
+ * @param {unknown} text @returns {object|null}
+ */
+function parseEventData(text) {
+  try {
+    const parsed = JSON.parse(String(text ?? ''));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 「没有采集数据」时的空聚合形状。
+ * buildHud 的降级分支与 readOwnActivity 的返回契约必须同形——放一处，别各写一份。
+ * @returns {{focus:object, heatmap:object[]}}
+ */
+function emptyActivity() {
+  return {
+    focus: {
+      available: false,
+      window: '24h',
+      trackingMinutes: 0,
+      top: [],
+      longest: { app: '', title: '', minutes: 0 },
+    },
+    heatmap: [],
+  };
+}
+
+/**
  * 本地采集库 → 专注卡的两个数据块：最近 24 小时的应用时长 + 84 天每日活跃分钟。
  *
  * 返回值与 v1.1.0 从 ActivityWatch 取数时**完全同构**（客户端一行都不用改）：
@@ -520,13 +561,8 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
   /** AFK 区间（毫秒）。data 是原始 JSON，形状由采集器/迁移决定，必须自己解析。 */
   const afkSpans = [];
   for (const row of afkRows) {
-    let data;
-    try {
-      data = JSON.parse(row.data);
-    } catch {
-      continue;
-    }
-    if (String(data?.status) !== 'afk') continue;
+    const data = parseEventData(row.data);
+    if (!data || String(data.status) !== 'afk') continue;
     const start = Date.parse(row.ts);
     if (!Number.isFinite(start)) continue;
     afkSpans.push([start, start + Math.max(0, Number(row.duration) || 0) * 1000]);
@@ -553,12 +589,8 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
     const duration = Number(row.duration) || 0;
     if (!Number.isFinite(startMs) || duration <= 0) continue;
 
-    let data;
-    try {
-      data = JSON.parse(row.data);
-    } catch {
-      continue;
-    }
+    const data = parseEventData(row.data);
+    if (!data) continue;
 
     const endMs = startMs + duration * 1000;
     // 扣掉 AFK 后的活跃秒数。**热力与「最近 24 小时」必须同一口径**：
@@ -587,7 +619,8 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
     recentSeconds += inside;
     recentByApp.set(appName, (recentByApp.get(appName) ?? 0) + inside);
     if (inside > longest.seconds) {
-      longest = { app: appName, title: titleName, seconds: inside };
+      // 与 top 同一套显示名（别名），别让同一个应用在卡片里有两个名字。
+      longest = { app: appDisplayName(appName, aliases), title: titleName, seconds: inside };
     }
   }
 
@@ -1076,7 +1109,8 @@ export function captureStatus() {
     pid: state?.pid ?? null,
     dbPath: state?.dbPath ?? null,
     samples: state?.samples ?? 0,
-    rows: state?.rows ?? 0,
+    // 写入次数（INSERT + UPDATE），不是库内行数；未闭合事件每 60 秒会 UPDATE 一次。
+    writes: state?.rows ?? 0,
     pending: state?.pending.length ?? 0,
     restarts: state?.restarts ?? 0,
     // 采集器 stdout 里解析不出来的行数（正常应为 0；不为 0 说明 PowerShell 往 stdout
@@ -2062,7 +2096,7 @@ export async function buildHud(config = {}, runtime = {}) {
   const aliases = settings.appAliases ?? config.appAliases ?? {};
   const failActivity = (error) => {
     warnings.push(`activity: ${error instanceof Error ? error.message : String(error)}`);
-    return { focus: { available: false, window: '24h', trackingMinutes: 0, top: [], longest: { app: '', title: '', minutes: 0 } }, heatmap: [] };
+    return emptyActivity();
   };
 
   const [activity, weather, sessions] = await Promise.all([

@@ -594,15 +594,15 @@ try {
 
     // 隔 10 秒再取一次：samples 必须涨（采集器在真的采样，不是僵住）
     const before = Number(first.body?.capture?.samples ?? 0);
-    const rowsBefore = Number(first.body?.capture?.rows ?? 0);
+    const writesBefore = Number(first.body?.capture?.writes ?? 0);
     await sleep(10000);
     const second = await fetchHud(hudUrl);
     const after = Number(second.body?.capture?.samples ?? 0);
-    const rowsAfter = Number(second.body?.capture?.rows ?? 0);
+    const writesAfter = Number(second.body?.capture?.writes ?? 0);
     check('E8 10 秒后 capture.samples 增长（采样在跑）', after > before,
       `${before} → ${after}`);
-    check('E9 capture.rows 不减少（落盘没回退）', rowsAfter >= rowsBefore,
-      `${rowsBefore} → ${rowsAfter}`);
+    check('E9 capture.writes 不减少（落盘没回退）', writesAfter >= writesBefore,
+      `${writesBefore} → ${writesAfter}`);
     check('E10 两次请求 warnings 都为空（运行期零 AW 依赖）',
       (second.body?.warnings ?? ['?']).length === 0, JSON.stringify(second.body?.warnings));
 
