@@ -1,7 +1,7 @@
 # AGENTS.md — dsh-lifehud 协作手册
 
 > 给接手的 AI：读这一份就能继续开发。**只写长期稳定的事实**，版本细节写 `spike/RESULT.md`。
-> 最后更新：2026-11-10 ｜ 插件版本：1.1.1
+> 最后更新：2026-11-12 ｜ 插件版本：1.1.2
 
 ---
 
@@ -12,7 +12,7 @@
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
 | 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 45 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 48 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
 | 认识专注卡那条链路 | 本文件 §7「专注卡怎么工作」+ `plugin/collector.ps1`，代码入口 `startCollector()` / `readOwnActivity()` |
@@ -85,7 +85,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 | 专注 / 热力 | **自采集**：`plugin/collector.ps1` → `<dataDir>/capture.db` | Host spawn 长驻 PowerShell 子进程，stdout 每 2 秒一行 JSON；Host 合并成带 `duration` 的事件写库；页面只读库 | 零安装（PowerShell 5.1 + C# P/Invoke）；`storeTitles:false` 只存应用名；**AFK 区间必须从窗口事件里扣掉**，否则 explorer.exe 会占几百分钟；采集器只能由 Host 启停（见 §6 孤儿进程） |
 | ActivityWatch（历史） | `%LOCALAPPDATA%\activitywatch\activitywatch\aw-server\peewee-sqlite.v2.db` | 只在 **首次迁移** 时读一次文件（先复制含 -wal/-shm 的副本到 tmpdir 再只读打开），把全部 bucket + `events.data` 原始 JSON + `settings.json` 的 `classes` 搬进 `capture.db` | **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**——用 id 文本查会静默返回 0 行；迁移幂等（`meta.history_imported`）；运行期**零 AW 依赖** |
 | 体重 | 小米云 `https://api.io.mi.com/app/user/get_user_device_data` | POST，`type=weight` / `key=bodyInfo` / `group=raw`，**时间单位是秒**；RC4 签名 + 会话文件 | 会话默认读 `<dataDir>/mi-session.json`（**不进 git**）；设备号**自动发现**（`/home/device_list` 里 model 带 `scales` 的那台），不写死；`weightId` 必须按 TEXT 存；Host 每 10 分钟自动同步，`?force=1` 跳过 TTL。细节见 `docs/小米云取数.md` |
-| 检查更新（v1.1.2） | GitHub REST：`/repos/<owner>/<repo>/releases/latest`，404 时回退 `/tags?per_page=30` | 只在页面手动点「检查更新」时请求；`user-agent: dsh-lifehud/<版本>`，不带任何凭据 | 取 tags 里**最大**的语义版本，不取第一个；结果只缓存在 Host 内存（`updateTtlMs` 默认 6 小时），不落盘；失败返回 `stale` 快照，从不抛给页面 |
+| 检查更新（v1.1.2） | GitHub REST：`/repos/<owner>/<repo>/releases/latest`，404 时回退 `/tags?per_page=30` | 只在页面手动点「检查更新」时请求；`user-agent: dsh-lifehud/<版本>`，不带任何凭据 | 取 tags 里**最大**的语义版本，不取第一个；**没有 TTL 缓存**（手动点就该真打一次），只保留最近一次成功结果用于失败降级；并发连点由单飞合并；失败返回 `stale` 快照，从不抛给页面 |
 
 ## 5. 约定（照做）
 
@@ -121,6 +121,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **迁移与实时采集的时序**：必须在 `startCollector()` **之前**跑 `importHistory()`，靠 `meta.history_imported='1'` 保证幂等；否则两段数据会重叠。
 - **「最近 24 小时」与热力日历必须同一套扣 AFK 口径**：`readOwnActivity()` 里 `seconds`（扣 AFK，给热力和过滤用）与 `inside`（24h 的 tracking/top/longest）曾经是两套口径，真机上出现过 `tracking=705.6` 而同日热力只有 `354` 分钟的自相矛盾（v1.1.0 从 AW 取数时就有的继承缺陷，2026-11-10 验收抓到，commit `69a3f02` 已修）。现在 24h 用 `inside = overlap * (seconds / duration)`。改这里先跑 `node spike/probe-focus.mjs`。
 - **AW 停了以后别指望它回来**：本机 2026-11-10 按验收要求停掉了 aw-qt / aw-server / aw-watcher-afk / aw-watcher-window，插件不再依赖它们（只迁移时读文件）。要恢复 AW 得用户自己启动。
+- **写库事务回滚后必须清 rowId**：`flushCapture()` 在事务里 INSERT 后把 `lastInsertRowid` 记到段上；一旦后续语句/COMMIT 失败触发 ROLLBACK，这些 rowId 已不存在。若不清空，下一轮会走 UPDATE 命中 0 行、SQLite 不报错 → **一段专注数据静默丢失**。`spike/probe-capture.mjs` E1–E4 覆盖（fake state，不碰磁盘）。
 
 ## 7. 当前状态
 
@@ -134,7 +135,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - ✅ 开机预热：Host `apply()` 里先跑一次 `buildHud` + `readWeight`；Client 加载时 `fetchHud()` / `fetchWeight()` 预取。
 - ✅ HUD 自动刷新（v1.1.1）：Client `useHud()` 每 5 分钟静默重取一次（页面隐藏时不发请求，`visibilitychange` 回页面补一次；三道护栏防并发：hidden / `prefetch` 在飞 / `HUD_TTL` 未过期都跳过）。
 - ✅ 体重同步：Host 每 10 分钟自动拉一次小米云（定时器可 dispose）；页面「刷新」按钮带 `?force=1` 立即拉，**这是"刚踩秤就能看到"的主路径**。
-- ✅ 检查更新（v1.1.2）：页面「设置 → 版本与更新」手动点才联网（**不做启动自动检查**）；Host 读 GitHub Release/Tag，取最大语义版本；`/hud` 新增 `version` 字段（Host 版本），页面拿它和 `BUILD` 对比提示「页面资源旧了」；上次结果存 localStorage（键 `lifehud.update.v1`，版本变了自动作废）。
+- ✅ 检查更新（v1.1.2）：页面「设置 → 版本与更新」手动点才联网（**不做启动自动检查**）；Host 读 GitHub Release/Tag，取最大语义版本，有 Release 就显示发布日期与正文；`/hud` 新增 `version` 字段（Host 版本），页面拿它和 `BUILD` 对比提示「页面资源旧了」；上次结果存 localStorage（键 `lifehud.update.v1`，版本变了自动作废，只回显不发请求）。
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
 - ⚠️ 天气的"一句话"是规则拼的，不是模型生成。
 
@@ -156,9 +157,9 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
 - **AFK**：`idle ≥ afkThresholdSeconds`（默认 180）记为 `afk` 区间。聚合时**窗口时长一律扣掉 AFK**：热力按扣后秒数算，24h 的 `tracking/top/longest` 按 `overlap × 活跃占比` 算（同一个比例，别写成两套口径）；`explorer.exe + Program Manager` 一律丢弃（锁屏/桌面焦点）。
 - **迁移**：首次启动 `importHistory()` → 复制 AW 库副本（含 `-wal`/`-shm`）到 tmpdir → 只读打开 → 全部 bucket + `events.data` 原样 + `settings.json` 的 `classes` 进 `meta.aw_classes` → `meta.history_imported='1'`（幂等）。**迁完就可以卸载 AW**。
 - **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]`，卡片显示「还没有采集到数据」，HUD 其余部分照常。
-- **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, rows, pending, restarts, pollSeconds, lastSampleAt, lastError, warnings[]}`；采集器 stderr / 退出码 / 迁移失败都会进 `warnings`（设置 → 诊断区可见）。
+- **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, rows, pending, restarts, noise, pollSeconds, lastSampleAt, lastError, warnings[]}`（`rows` 是 INSERT+UPDATE 的写入次数，不是库内行数）。采集器 stderr 只在进程退出时随详情进 `warnings`，另有退出码与迁移失败。这些字段只走 `/hud` 接口与探针；设置里的诊断区目前只渲染 `warnings` 文本，**不渲染 `capture.*`**。
 - **改它的入口**：`plugin/collector.ps1`（采样）、`startCollector/appendSample/flushCapture`（合并与落盘）、`readOwnActivity`（聚合）、`importHistory`（迁移）。
-- **验证**：`node spike/probe-capture.mjs`（45 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等）、`node spike/probe-hud.mjs`（确定性 20 项）、`node spike/probe-hud.mjs --real`（真实库 23 项）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP）。
+- **验证**：`node spike/probe-capture.mjs`（48 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等 / 写库回滚）、`node spike/probe-hud.mjs`（确定性 20 项）、`node spike/probe-hud.mjs --real`（真实库 23 项）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP）。
 
 ### 体重卡怎么工作（v1.1.0，重要）
 

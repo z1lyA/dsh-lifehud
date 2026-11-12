@@ -2,7 +2,7 @@
 
 > **抬头（LifeHud）** —— 长在 DeepSeek Harness 里的个人工作台：一屏看完今天该干什么、外面什么情况、我昨天停在哪里。
 
-**v1.1.1** · 零依赖 · 单个 DSH 插件 · 不改动任何被读取的应用（专注数据由自己采集，见下）
+**v1.1.2** · 零依赖 · 单个 DSH 插件 · 不改动任何被读取的应用（专注数据由自己采集，见下）
 
 ## 装什么、读什么
 
@@ -45,8 +45,8 @@ plugin_manager({ action: 'install_bundle', target: '<本仓库路径>/plugin' })
 
 页面「设置 → 版本与更新」里有一个「检查更新」按钮：点一下才知道远端有没有新版本，**不会自动联网**。
 
-- 数据源：公开仓库 `z1lyA/dsh-lifehud` 的 GitHub Release / Tag（只读）。有 Release 就显示发布页与正文，没有就回退到 tags 取最大的 `vX.Y.Z`。
-- 只带 `user-agent: dsh-lifehud/<版本>`，不带账号、设备号或 token；结果只缓存在内存（6 小时），不落盘。
+- 数据源：公开仓库 `z1lyA/dsh-lifehud` 的 GitHub Release / Tag（只读）。有 Release 就显示发布页、发布日期与正文，没有就回退到 tags 取最大的 `vX.Y.Z`。
+- 只带 `user-agent: dsh-lifehud/<版本>`，不带账号、设备号或 token；Host 只把最近一次结果留在内存里（仅用于失败降级），页面把上次手动查到的结果显示在设置里（localStorage，不发请求）。
 - 同时显示 Host 版本与页面资源版本；两者不一致会提示按 `Ctrl+R`，避免「Host 升级了、浏览器还在跑旧代码」的假故障。
 - 升级步骤就写在弹窗里：`git pull` → `plugin_manager` remove_bundle → install_bundle → 刷新页面。
 - 离线、超时、GitHub 限流、仓库名写错都有中文提示，并保留上一次查到的结果（标 `stale`）。
@@ -74,7 +74,6 @@ plugin_manager({ action: 'install_bundle', target: '<本仓库路径>/plugin' })
 | `historySource` | 自动推导 | ActivityWatch 库路径，正常情况不用填 |
 | `updateCheck` | `true` | `false` 完全关掉检查更新（不联网，路由返回 `disabled`） |
 | `updateRepo` | `z1lyA/dsh-lifehud` | 检查哪个仓库；fork 时改成自己的 `owner/name` |
-| `updateTtlMs` | `21600000` | 检查结果缓存 6 小时（只有手动点按钮才联网） |
 
 天气位置也可以在页面「设置」里点「使用我的位置」自动写入。
 体重卡、「专注卡采集」两个开关都在「设置」里（存 localStorage，与其它界面设置同一套）。
