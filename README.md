@@ -13,7 +13,7 @@ LifeHud 自己**几乎不产生数据**：只有「专注 / 热力」是它自�
 | 当前时段任务 | [NowTree](https://github.com/z1lyA/NowTree) 的 `nowtree.sqlite` | `node:sqlite` 只读打开，按 `time_slot` 过滤 |
 | 天气 | Open-Meteo（无需 key） | 48 小时逐时数据，可跨午夜 |
 | 最近会话 | DSH 的 `session_projcache` | 读 json；已删除的会话（无日志目录）不显示 |
-| 专注（v1.1.1） | **本机自采集**：`plugin/collector.ps1` 每 2 秒读前台窗口与空闲时间 | 减掉 AFK 区间，按应用聚合最近 24 小时，并显示最长一段 |
+| 专注（v1.1.1） | **本机自采集**：`plugin/collector.ps1` 每 2 秒读前台窗口与空闲时间 | 减掉 AFK 区间，按应用聚合最近 24 小时，并显示最长一段；空闲强度按四档另存（v1.1.2，页面暂未展示） |
 | 热力日历 | 同一份本地采集库 `<dataDir>/capture.db` | 当月每日活跃分钟，分位数分档 |
 | 相框 | 本地文件 `~/.dsh/lifehud/` | 自己上传 |
 | 体重（v1.1.0） | 小米云 `user/get_user_device_data`（MX80 体脂秤） | 只读拉取，落地到自己的 SQLite 镜像；画最近有数据的 7 个测量日（纵轴刻度 + 悬停看某天数值） |
@@ -90,7 +90,7 @@ plugin_manager({ action: 'install_bundle', target: '<本仓库路径>/plugin' })
 ## 目录
 
 ```
-plugin/        唯一被 DSH 加载的包（index.js = Host，client.js = 浏览器，collector.ps1 = 专注采集器）
+plugin/        唯一被 DSH 加载的包（index.js = Host 入口，lib/ = Host 实现，client.js = 浏览器，collector.ps1 = 专注采集器）
 docs/          ADR（架构决策）+ 小米云取数方法 + BACKLOG（评审里先不做的事，含拆法与验收标准）
 spike/         独立探针与验证脚本（不依赖 DSH 也能跑）+ RESULT.md 结论
 AGENTS.md      给接手 AI 的协作手册（含所有踩过的坑）
@@ -108,6 +108,7 @@ AGENTS.md      给接手 AI 的协作手册（含所有踩过的坑）
 - 天气的「一句话」是规则拼接，不是模型生成。
 - HUD 快照（任务/天气/会话/专注/热力）现在每 **5 分钟**自动刷新一次（页面隐藏时不拉，回到页面补一次）；体重仍由 Host 每 10 分钟自动同步。
 - 专注数据**只在 DSH 运行期间采集**：DSH 关着的时间段没有数据（7×24 采集不做）。
+- 空闲强度（`idle_seconds` 四档）从 v1.1.2 起已落库，但页面还没展示；留给 1.2 详情页。
 - 「专注卡采集」开关目前只影响**展示**，Host 还在继续采集（真正停采是 1.2 的事）。
 - **检查更新只在手动点按钮时联网**（这是刻意的：不想让页面加载时替你发请求）；GitHub 未登录限流 60 次/小时，限流时会显示提示并沿用上次结果。插件是 `link:` 安装，所以升级要 `git pull` + 重装，没有「点一下自动更新」。
 - 小米云会话过期后要**手动重新登录一次**才能续上（卡片会红字提示，历史数据不丢）——步骤见 [`docs/小米云取数.md`](docs/小米云取数.md)。

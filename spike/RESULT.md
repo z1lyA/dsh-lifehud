@@ -252,11 +252,31 @@ AFK 区间不精确切分到事件内部，按占比摊到整段——**热力�
   - P7：`longest` 不再是死字段——专注卡在条形图下面显示「最长：<应用> · N 分钟」，且 `longest.app` 与 `top` 一样套别名；
   - P8：`capture.rows` 改名 `capture.writes`（纯诊断字段，页面未用），探针与文档同步。
 
+### 后续补齐（2026-11-12，v1.1.2 同一版内）
+
+用户要求把「先不做」的项也在本版做完（除回改历史提交），落地：
+
+- **S3 拆 `index.js`**：入口只剩 `apply` / 路由注册 + 再导出（359 行）；实现分到 `plugin/lib/`：
+  `capture.js`（采集/合并/迁移）、`activity.js`（专注聚合）、`weight.js`（小米云+镜像）、
+  `update.js`（检查更新）、`hud.js`（任务/天气/会话/`buildHud`）、`settings.js`、`util.js`。
+  探针仍从 `plugin/index.js` 导入（入口再导出），无需改探针；`package.json` 的 `files` 加入 `lib`；
+  `collector.ps1` 与 `package.json` 的相对路径改成 `../`。
+- **P1 `idle_seconds` 第三流**：`appendSample()` 把空闲秒数映射成 `0-10/10-60/60-180/180+` 四档，
+  写入 `buckets.type='idle'` 的第三条流（离散档位才不破坏合并压缩）；`readOwnActivity()` 输出
+  `idle.levels`（24h 每档分钟数），`buildHud()` 透传 `idle`；页面暂不消费，留给 1.2。
+- **两条基线探针**：
+  - `probe-weight` 1.3 改成「本地镜像 ⊇ 云端本次返回」（云端只回时间窗内的 43 条，本地保留 47 行）；
+  - `probe-capture` D14 改成「AW 最后数据仍在 24h 内时才要求 top 非空」，D15 只对「AW 当天真实窗口工作 ≥ 60 秒」的日子要求热力非零
+    （排除 explorer/Program Manager 空转段与按分钟四舍五入的 0）。
+- **探针最终数字（2026-11-12，端口 55409）**：`probe-update` 32/32（离线）/ 34/34（HTTP）、
+  `probe-hud` 21/21、`probe-hud --real` 24/24、`probe-focus` 60/60、`probe-capture` 50/50、`probe-weight` 46/46、`prepublish-check` 干净。
+
 ### 已知限制
 
 - 只认 `vX.Y.Z` 形状的 tag；`nightly` 之类的名字会被跳过（当前发版流程全是正式 tag）。
 - 未做 ETag/条件请求；手动点的频率（正常每天几次）远低于未登录 60 次/小时。
 - 浏览器的「上次检查结果」按 Host 版本作废：插件升级后需要重新点一次，避免拿旧结论误导。
-- 未修、已写进 [`docs/BACKLOG.md`](docs/BACKLOG.md)（含为什么先不做、拆法、验收标准）：`index.js` 拆模块（S3）、`idle_seconds` 第三流（P1）、两条基线探针红项。明确不回改历史提交（S10，已 push，重写要 force push）。
+- 空闲强度已落库但页面未展示；留在 [`docs/BACKLOG.md`](docs/BACKLOG.md) 的 1.2 候选里。
+- 明确不回改历史提交（S10，已 push，重写要 force push）。
 
 

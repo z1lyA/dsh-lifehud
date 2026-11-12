@@ -12,7 +12,7 @@
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
 | 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 48 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
 | 认识专注卡那条链路 | 本文件 §7「专注卡怎么工作」+ `plugin/collector.ps1`，代码入口 `startCollector()` / `readOwnActivity()` |
@@ -61,9 +61,10 @@ package.json 的 dsh.client + exports["./client"] → 浏览器加载 client.js
 
 ```
 plugin/            ← 唯一会被 DSH 加载的东西
-  package.json     dsh.bundle / dsh.client / exports
+  package.json     dsh.bundle / dsh.client / exports / files
   cordis.patch.yml Host 行的 config（默认值都在代码里推导，这里通常不用改）
-  index.js         Host：HTTP 路由 + 数据源 + 采集（startCollector/readOwnActivity）+ 迁移
+  index.js         Host 入口：apply / 路由注册 + 对 lib 的再导出
+  lib/             Host 实现：capture（采集/迁移）、activity（专注聚合）、weight、update、hud、settings、util
   client.js        浏览器：设置、卡片、渲染
   collector.ps1    专注采集器：长驻 PowerShell 子进程，每 N 秒输出一行 JSON
 spike/             探查脚本与结论（probe-*.mjs、paths.mjs、RESULT.md）
@@ -82,7 +83,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 | NowTree 时段分界 | `%LOCALAPPDATA%\com.nowtree.app\EBWebView\Default\Local Storage\leveldb` | 字节搜索 `nowtree_slot_bounds`，取后面的 `{"morningStart":…}` | 值可能是 UTF-16，用 latin1 + 正则兜底；读不到就回退 6/13/18 |
 | 天气 | `https://api.open-meteo.com/v1/forecast` | 无需 key；`hourly=temperature_2m,precipitation_probability,weather_code,is_day` | Host 缓存 10 分钟；换位置后置空缓存 |
 | DSH 会话 | `$DSH_HOME/storages/session_projcache/sessions/session-<uuid>.json` | 读 json，`rows.title.val` + `rows.sessionListMetadata.val.lastPromptAt` | **sessionId 就是文件名里的 uuid**（去掉 `session-` 前缀）。不要解压 `session.v4.jsonl.zstd` |
-| 专注 / 热力 | **自采集**：`plugin/collector.ps1` → `<dataDir>/capture.db` | Host spawn 长驻 PowerShell 子进程，stdout 每 2 秒一行 JSON；Host 合并成带 `duration` 的事件写库；页面只读库 | 零安装（PowerShell 5.1 + C# P/Invoke）；`storeTitles:false` 只存应用名；**AFK 区间必须从窗口事件里扣掉**，否则 explorer.exe 会占几百分钟；采集器只能由 Host 启停（见 §6 孤儿进程） |
+| 专注 / 热力 | **自采集**：`plugin/collector.ps1` → `<dataDir>/capture.db` | Host spawn 长驻 PowerShell 子进程，stdout 每 2 秒一行 JSON；Host 合并成带 `duration` 的事件写库（窗口 / AFK / 空闲强度三条流）；页面只读库 | 零安装（PowerShell 5.1 + C# P/Invoke）；`storeTitles:false` 只存应用名；**AFK 区间必须从窗口事件里扣掉**，否则 explorer.exe 会占几百分钟；采集器只能由 Host 启停（见 §6 孤儿进程）；`idle_seconds` 只存**离散档位**（`0-10/10-60/60-180/180+`），别存原始秒数 |
 | ActivityWatch（历史） | `%LOCALAPPDATA%\activitywatch\activitywatch\aw-server\peewee-sqlite.v2.db` | 只在 **首次迁移** 时读一次文件（先复制含 -wal/-shm 的副本到 tmpdir 再只读打开），把全部 bucket + `events.data` 原始 JSON + `settings.json` 的 `classes` 搬进 `capture.db` | **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**——用 id 文本查会静默返回 0 行；迁移幂等（`meta.history_imported`）；运行期**零 AW 依赖** |
 | 体重 | 小米云 `https://api.io.mi.com/app/user/get_user_device_data` | POST，`type=weight` / `key=bodyInfo` / `group=raw`，**时间单位是秒**；RC4 签名 + 会话文件 | 会话默认读 `<dataDir>/mi-session.json`（**不进 git**）；设备号**自动发现**（`/home/device_list` 里 model 带 `scales` 的那台），不写死；`weightId` 必须按 TEXT 存；Host 每 10 分钟自动同步，`?force=1` 跳过 TTL。细节见 `docs/小米云取数.md` |
 | 检查更新（v1.1.2） | GitHub REST：`/repos/<owner>/<repo>/releases/latest`，404 时回退 `/tags?per_page=30` | 只在页面手动点「检查更新」时请求；`user-agent: dsh-lifehud/<版本>`，不带任何凭据 | 取 tags 里**最大**的语义版本，不取第一个；**没有 TTL 缓存**（手动点就该真打一次），只保留最近一次成功结果用于失败降级；并发连点由单飞合并；失败返回 `stale` 快照，从不抛给页面 |
@@ -114,7 +115,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **体重卡的图表不能用 SVG `<text>`**：SVG 走 `preserveAspectRatio="none"` 做自适应拉伸，`<text>` 会被非等比拉变形。所有文字（纵轴刻度、点值、日期）一律用 HTML 绝对定位覆盖层。
 - **AW 的 `eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**。拿 `id` 文本去 `WHERE bucket_id = ?` 会**静默返回 0 行**（2026-11-10 实测踩到）。迁移必须 `JOIN bucketmodel b ON b.key = e.bucket_id`。
 - **PowerShell 子进程的 stdout 编码**：Windows PowerShell 5.1 在管道下默认按 ANSI/OEM 输出，中文窗口标题到 Node 侧就是乱码。`collector.ps1` 开头必须 `[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)`；脚本本身保持**纯 ASCII**（PS 5.1 按 ANSI 读脚本，非 ASCII 字节会被误读）。
-- **采集器绝不能靠 `spawn('powershell')` 依赖 PATH，也不要点名 `pwsh`**（本机没有）。用 `join(process.env.WINDIR, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')`；脚本路径用 `fileURLToPath(new URL('./collector.ps1', import.meta.url))`。
+- **采集器绝不能靠 `spawn('powershell')` 依赖 PATH，也不要点名 `pwsh`**（本机没有）。用 `join(process.env.WINDIR, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')`；脚本路径用 `fileURLToPath(new URL('../collector.ps1', import.meta.url))`（在 `lib/capture.js` 里，所以是上一级）。
 - **孤儿进程**：采集器是长驻子进程，disposer 顺序必须是 `child.kill()` → `flushPending()` → `db.close()`，另注册一次 `process.on('exit')` 兜底。重启要指数退避并封顶（5 次），收到有效样本就把计数清零（否则跑几周后被历史崩溃次数拖死）。
 - **capture.db 用 WAL**（`journal_mode=WAL` + `synchronous=NORMAL` + `busy_timeout=3000`）：写句柄常驻、页面每次请求另开只读连接，没有 WAL 会偶发 `SQLITE_BUSY`。代价是 `dataDir` 里会多出 `capture.db-wal` / `-shm`（`.gitignore` 已挡 `capture.db*`）。
 - **未闭合事件也要先落盘**：合并语义下"同一个应用 8 小时"只有一行，如果只在事件切换时才 INSERT，页面一小时内会一直是空的。做法是首个样本就 INSERT，之后每 `CAPTURE_FLUSH_MS`（60s）原地 `UPDATE duration`。
@@ -122,6 +123,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **「最近 24 小时」与热力日历必须同一套扣 AFK 口径**：`readOwnActivity()` 里 `seconds`（扣 AFK，给热力和过滤用）与 `inside`（24h 的 tracking/top/longest）曾经是两套口径，真机上出现过 `tracking=705.6` 而同日热力只有 `354` 分钟的自相矛盾（v1.1.0 从 AW 取数时就有的继承缺陷，2026-11-10 验收抓到，commit `69a3f02` 已修）。现在 24h 用 `inside = overlap * (seconds / duration)`。改这里先跑 `node spike/probe-focus.mjs`。
 - **AW 停了以后别指望它回来**：本机 2026-11-10 按验收要求停掉了 aw-qt / aw-server / aw-watcher-afk / aw-watcher-window，插件不再依赖它们（只迁移时读文件）。要恢复 AW 得用户自己启动。
 - **写库事务回滚后必须清 rowId**：`flushCapture()` 在事务里 INSERT 后把 `lastInsertRowid` 记到段上；一旦后续语句/COMMIT 失败触发 ROLLBACK，这些 rowId 已不存在。若不清空，下一轮会走 UPDATE 命中 0 行、SQLite 不报错 → **一段专注数据静默丢失**。`spike/probe-capture.mjs` E1–E4 覆盖（fake state，不碰磁盘）。
+- **`idle_seconds` 只能按离散档位落库**：合并语义靠 `data` 完全相等延长事件；存每秒变化的原始值会让「8 小时一个应用」变成 14,400 行。`appendSample` 把它映射成 `0-10/10-60/60-180/180+` 四档，写进第三条流（`buckets.type='idle'`）。改档位先跑 `node spike/probe-focus.mjs` D11/D12。
 
 ## 7. 当前状态
 
@@ -139,27 +141,28 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
 - ⚠️ 天气的"一句话"是规则拼的，不是模型生成。
 
-### 专注卡怎么工作（v1.1.1，重要）
+### 专注卡怎么工作（v1.1.2，重要）
 
 ```
 Windows user32/kernel32
    ↑ P/Invoke（C#，靠 Windows 自带 PowerShell 5.1 在内存里编译，零安装）
 plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF-8）
-   └→ Host startCollector()   spawn + readline；崩了指数退避重启（≤5 次，收到样本即清零）
-      └→ appendSample()       窗口流 / AFK 流各一条未闭合事件；同 data 且间隔 ≤ pulsetime(≥10s) 就延长
+   └→ lib/capture.js startCollector()  spawn + readline；崩了指数退避重启（≤5 次，收到样本即清零）
+      └→ appendSample()       窗口 / AFK / 空闲强度三条流各一条未闭合事件；同 data 且间隔 ≤ pulsetime(≥10s) 就延长
          └→ <dataDir>/capture.db   node:sqlite（WAL）—— buckets + events(data 原始 JSON) + meta
-            └→ readOwnActivity()  JOIN buckets 按 type 取窗口/AFK 两条流；窗口时长扣掉 AFK 区间
-               └→ buildHud()       → focus / heatmap（与 v1.1.0 的 AW 版本**完全同构**，Client 一行没改）
+            └→ lib/activity.js readOwnActivity()  JOIN buckets 按 type 取三条流；窗口时长扣掉 AFK 区间
+               └→ lib/hud.js buildHud() → focus / heatmap / idle
                   └→ GET /lifehud/api/hud   （另含 capture: captureStatus() 诊断字段）
 ```
 
 - **写读分离**：采集只由 Host 后台做，页面请求只读本地库，不触发采集、不联网。
 - **AFK**：`idle ≥ afkThresholdSeconds`（默认 180）记为 `afk` 区间。聚合时**窗口时长一律扣掉 AFK**：热力按扣后秒数算，24h 的 `tracking/top/longest` 按 `overlap × 活跃占比` 算（同一个比例，别写成两套口径）；`explorer.exe + Program Manager` 一律丢弃（锁屏/桌面焦点）。
+- **空闲强度（v1.1.2）**：`idle_seconds` 映射成 `0-10 / 10-60 / 60-180 / 180+` 四档，作为第三条流写库；`/hud` 的 `idle.levels` 是 24h 内每档的分钟数。页面暂不展示，留给 1.2 详情页。
 - **迁移**：首次启动 `importHistory()` → 复制 AW 库副本（含 `-wal`/`-shm`）到 tmpdir → 只读打开 → 全部 bucket + `events.data` 原样 + `settings.json` 的 `classes` 进 `meta.aw_classes` → `meta.history_imported='1'`（幂等）。**迁完就可以卸载 AW**。
-- **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]`，卡片显示「还没有采集到数据」，HUD 其余部分照常。
+- **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]` + `idle` 四档 0，卡片显示「还没有采集到数据」，HUD 其余部分照常。
 - **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, writes, pending, restarts, noise, pollSeconds, lastSampleAt, lastError, warnings[]}`（`writes` 是 INSERT+UPDATE 的写入次数，不是库内行数；v1.1.2 从 `rows` 改名）。采集器 stderr 只在进程退出时随详情进 `warnings`，另有退出码与迁移失败。这些字段只走 `/hud` 接口与探针；设置里的诊断区目前只渲染 `warnings` 文本，**不渲染 `capture.*`**。
-- **改它的入口**：`plugin/collector.ps1`（采样）、`startCollector/appendSample/flushCapture`（合并与落盘）、`readOwnActivity`（聚合）、`importHistory`（迁移）。
-- **验证**：`node spike/probe-capture.mjs`（48 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等 / 写库回滚）、`node spike/probe-hud.mjs`（确定性 20 项）、`node spike/probe-hud.mjs --real`（真实库 23 项）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP）。
+- **改它的入口**：`plugin/collector.ps1`（采样）、`lib/capture.js`（合并/落盘/迁移）、`lib/activity.js`（聚合）、`lib/hud.js`（组装）。
+- **验证**：`node spike/probe-capture.mjs`（50 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等 / 写库回滚）、`node spike/probe-hud.mjs`（确定性 21 项）、`node spike/probe-hud.mjs --real`（真实库 24 项）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP）。
 
 ### 体重卡怎么工作（v1.1.0，重要）
 
@@ -219,7 +222,7 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
 5. 专注卡「关掉=真停采」：目前开关只影响展示（Host 仍在采集），要做需要 Client → Host 的通道（比如 `POST /lifehud/api/capture {enabled}`）。
 6. 热力日历换指标（当前是本地采集库的每日活跃分钟；token 需自建日表）。
 7. 检查更新「自动查/后台查」：现在刻意是手动（用户 2026-11-12 的选择）；若要改成启动自动查或发现新版弹提示，先跟用户确认联网频率。
-8. **结构清理 backlog**：拆 `index.js`、`idle_seconds` 第三流、两条基线探针的修法，全部写在 [`docs/BACKLOG.md`](docs/BACKLOG.md)（含为什么先不做、拆法、验收标准）。动这些之前先读那份，别凭记忆。
+8. **结构清理**：`index.js` 已在 v1.1.2 拆成 `lib/`（S3）；`idle_seconds` 已作为第三条流落库（P1）。剩下的后续项（检查更新自动查、1.2 空闲强度展示）与「明确不做」的清单在 [`docs/BACKLOG.md`](docs/BACKLOG.md)。
 
 ## 9. 与用户协作的方式
 
