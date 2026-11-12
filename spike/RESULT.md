@@ -207,7 +207,7 @@ AFK 区间不精确切分到事件内部，按占比摊到整段——**热力�
 - **7×24 采集不做**：DSH 没运行的时间段没有数据。
 - **不落 `idle_seconds`**：样本里的空闲秒数**不进** `events.data`。原因是合并语义靠 `data` 完全相同才延长事件，
   把逐样本变化的 `idle_seconds` 写进去等于每条样本都开新事件（8 小时一个应用会变成 14,400 行）。将来做「AFK 比例」用 AFK 流算即可。
-- **`capture.rows` 是「写入次数」不是「库行数」**（未闭合事件每 60s 会 UPDATE 一次），诊断用够，别当行数读。
+- **`capture.rows` 是「写入次数」不是「库行数」**（未闭合事件每 60s 会 UPDATE 一次），诊断用够，别当行数读。v1.1.2 起字段改名为 `capture.writes`，语义不变。
 - **AW 历史里有一条病态事件**：`msedge` 单条 25.1 小时（AW 当年停摆造成）。迁移忠实保留（一个字段不丢），但它会压低 11-07 / 11-08 的热力；详情页做统计时应给单条事件设上限。
 - **HMR 顺序边界**：若某个宿主先激活新 ctx、后 dispose 旧 ctx，旧 disposer 可能把采集器停掉（`stopCapture` 只停自己那一个 state，但同一模块实例下两次 `apply` 共享单例）。实测 `remove → install` 两次都正常；正常升级不受影响。
 
@@ -243,14 +243,20 @@ AFK 区间不精确切分到事件内部，按占比摊到整段——**热力�
 - **真 Bug：写库回滚丢数据**（评审 P6）。`flushCapture()` 事务回滚后，本轮 INSERT 得到的 `rowId` 已不存在；原实现没有清空，下一轮走 `UPDATE` 命中 0 行且 SQLite 不报错 → 一段专注数据静默丢失。现在按「本轮新插入的行」记录并在回滚时清 `rowId`；同时把闭合段/未闭合段的写库分派抽成 `writeSegmentRow()`。`probe-capture.mjs` E1–E4（fake state，不碰磁盘）覆盖：正常落盘、回滚清 rowId、闭合行重新排队、不误伤已有 rowId。
 - **删掉死缓存**（评审 P5）：唯一调用方永远手动点，原 `updateTtlMs` + `?force=1` 让 6 小时 TTL 永不命中，还和「结果存 localStorage」的文案打架。现在 Host 不做 TTL、只留最近一次成功结果用于失败降级；`updateTtlMs` 配置项一并删除。
 - **渲染 Release 正文与发布日期**（评审 P2）：`notes` 不再取了不用；有 Release 时设置里显示日期 + 正文（最多 400 字）。
-- **文档对齐**（评审 S2 / P9）：AGENTS 的 `capture` 字段补 `noise`、说清 `rows` 是写入次数、stderr 只在退出时进 warnings、诊断区只渲染 warnings 不渲染 `capture.*`。
+- **文档对齐**（评审 S2 / P9）：AGENTS 的 `capture` 字段补 `noise`、说清 `writes` 是写入次数、stderr 只在退出时进 warnings、诊断区只渲染 warnings 不渲染 `capture.*`。
 - **自查网补漏**（评审 S9）：`prepublish-check` 的 `FORBIDDEN_FILES` 加入 `capture.db` / `-wal` / `-shm`。
+- **顺手清掉的小项**（评审 S5 / S6 / S8 / P7 / P8）：
+  - S5：`readOwnActivity` 里窗口/AFK 两段重复的 `JSON.parse` 兜底抽成 `parseEventData()`；
+  - S6：`failActivity` 的空聚合字面量抽成 `emptyActivity()`，与 `readOwnActivity` 的返回契约同形；
+  - S8：Host 导出 `UPDATE_REASON_CODES`，`probe-update` 的 B3 断言 client 的翻译表覆盖全部码（新增码漏同步会红）；
+  - P7：`longest` 不再是死字段——专注卡在条形图下面显示「最长：<应用> · N 分钟」，且 `longest.app` 与 `top` 一样套别名；
+  - P8：`capture.rows` 改名 `capture.writes`（纯诊断字段，页面未用），探针与文档同步。
 
 ### 已知限制
 
 - 只认 `vX.Y.Z` 形状的 tag；`nightly` 之类的名字会被跳过（当前发版流程全是正式 tag）。
 - 未做 ETag/条件请求；手动点的频率（正常每天几次）远低于未登录 60 次/小时。
 - 浏览器的「上次检查结果」按 Host 版本作废：插件升级后需要重新点一次，避免拿旧结论误导。
-- 记账未修（评审里选择留到后续版本）：`idle_seconds` 不落库（与合并语义冲突，见上）、`longest` 前端未用、`capture.rows` 未改名、`index.js` 未拆模块。
+- 未修、已写进 [`docs/BACKLOG.md`](docs/BACKLOG.md)（含为什么先不做、拆法、验收标准）：`index.js` 拆模块（S3）、`idle_seconds` 第三流（P1）、两条基线探针红项。明确不回改历史提交（S10，已 push，重写要 force push）。
 
 

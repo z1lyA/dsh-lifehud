@@ -67,7 +67,7 @@ plugin/            ← 唯一会被 DSH 加载的东西
   client.js        浏览器：设置、卡片、渲染
   collector.ps1    专注采集器：长驻 PowerShell 子进程，每 N 秒输出一行 JSON
 spike/             探查脚本与结论（probe-*.mjs、paths.mjs、RESULT.md）
-docs/              公开文档：ADR（架构决策）+ 小米云取数方法
+docs/              公开文档：ADR（架构决策）+ 小米云取数方法 + BACKLOG（评审里先不做的事）
 notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档/原型），整目录被 `.gitignore` 忽略
 ```
 
@@ -125,7 +125,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 ## 7. 当前状态
 
-- ✅ 七张卡：当前时段任务、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图，**v1.1.1 起数据自己采**）、热力日历（当月 · GitHub 风格）、相框、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线）**。
+- ✅ 七张卡：当前时段任务、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图 + 最长一段，**v1.1.1 起数据自己采**）、热力日历（当月 · GitHub 风格）、相框、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线）**。
   「网页对话 ↗」是工具条上的外链按钮（`window.open`），**不是卡片**。
 - ✅ 布局：flex 便当盒两行 —— 行 1 = 天气(宽) · 体重 · 任务；行 2 = 专注 · 会话 · 相框 · 热力。
   （体重与热力 2026-11-09 换过位置：体重进更高的第一行、热力下到第二行第四格。）
@@ -157,7 +157,7 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
 - **AFK**：`idle ≥ afkThresholdSeconds`（默认 180）记为 `afk` 区间。聚合时**窗口时长一律扣掉 AFK**：热力按扣后秒数算，24h 的 `tracking/top/longest` 按 `overlap × 活跃占比` 算（同一个比例，别写成两套口径）；`explorer.exe + Program Manager` 一律丢弃（锁屏/桌面焦点）。
 - **迁移**：首次启动 `importHistory()` → 复制 AW 库副本（含 `-wal`/`-shm`）到 tmpdir → 只读打开 → 全部 bucket + `events.data` 原样 + `settings.json` 的 `classes` 进 `meta.aw_classes` → `meta.history_imported='1'`（幂等）。**迁完就可以卸载 AW**。
 - **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]`，卡片显示「还没有采集到数据」，HUD 其余部分照常。
-- **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, rows, pending, restarts, noise, pollSeconds, lastSampleAt, lastError, warnings[]}`（`rows` 是 INSERT+UPDATE 的写入次数，不是库内行数）。采集器 stderr 只在进程退出时随详情进 `warnings`，另有退出码与迁移失败。这些字段只走 `/hud` 接口与探针；设置里的诊断区目前只渲染 `warnings` 文本，**不渲染 `capture.*`**。
+- **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, writes, pending, restarts, noise, pollSeconds, lastSampleAt, lastError, warnings[]}`（`writes` 是 INSERT+UPDATE 的写入次数，不是库内行数；v1.1.2 从 `rows` 改名）。采集器 stderr 只在进程退出时随详情进 `warnings`，另有退出码与迁移失败。这些字段只走 `/hud` 接口与探针；设置里的诊断区目前只渲染 `warnings` 文本，**不渲染 `capture.*`**。
 - **改它的入口**：`plugin/collector.ps1`（采样）、`startCollector/appendSample/flushCapture`（合并与落盘）、`readOwnActivity`（聚合）、`importHistory`（迁移）。
 - **验证**：`node spike/probe-capture.mjs`（48 项：合并语义 / 真实采集器 / 中文编码 / 迁移幂等 / 写库回滚）、`node spike/probe-hud.mjs`（确定性 20 项）、`node spike/probe-hud.mjs --real`（真实库 23 项）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP）。
 
@@ -219,6 +219,7 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
 5. 专注卡「关掉=真停采」：目前开关只影响展示（Host 仍在采集），要做需要 Client → Host 的通道（比如 `POST /lifehud/api/capture {enabled}`）。
 6. 热力日历换指标（当前是本地采集库的每日活跃分钟；token 需自建日表）。
 7. 检查更新「自动查/后台查」：现在刻意是手动（用户 2026-11-12 的选择）；若要改成启动自动查或发现新版弹提示，先跟用户确认联网频率。
+8. **结构清理 backlog**：拆 `index.js`、`idle_seconds` 第三流、两条基线探针的修法，全部写在 [`docs/BACKLOG.md`](docs/BACKLOG.md)（含为什么先不做、拆法、验收标准）。动这些之前先读那份，别凭记忆。
 
 ## 9. 与用户协作的方式
 
