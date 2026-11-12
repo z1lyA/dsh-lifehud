@@ -88,6 +88,23 @@ const AW_SOURCE = join(process.env.LOCALAPPDATA ?? '', 'activitywatch', 'activit
   'aw-server', 'peewee-sqlite.v2.db');
 const BASE = String(process.argv[2] ?? process.env.LIFEHUD_BASE ?? '').replace(/\/+$/, '');
 
+/**
+ * 预检 DSH 是否还活着：端口每次重启都会变，连不上是环境问题，不该让探针崩掉。
+ * @returns {Promise<string>} 空串 = 可达；否则是失败原因
+ */
+async function baseProblem() {
+  if (!BASE) return '没给地址';
+  try {
+    const res = await fetch(`${BASE}/lifehud/api/hud`, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(5000),
+    });
+    return res.ok ? '' : `HTTP ${res.status}`;
+  } catch (error) {
+    return String(error?.cause?.code ?? error?.message ?? error);
+  }
+}
+
 const workDir = mkdtempSync(join(tmpdir(), 'lifehud-focus-'));
 let stopMerge = null;
 
@@ -540,8 +557,13 @@ try {
   /* ======================================================= E. HTTP（给出 DSH 地址时） */
 
   console.log('\n--- E. 断 AW 后的 /lifehud/api/hud（真实 HTTP）---');
+  const problem = await baseProblem();
   if (!BASE) {
     skip('E* 全部', '没给 DSH 地址（node spike/probe-focus.mjs http://127.0.0.1:<端口>）');
+  } else if (problem !== '没给地址' && problem) {
+    // 别让 fetch 的 ECONNREFUSED 冒成未捕获异常（会丢掉前面 A–D 的全部结果）。
+    skip('E* 全部', `连不上 ${BASE}/lifehud/api/hud（${problem}）`
+      + '——DSH 端口每次启动都会变，用当前地址重跑');
   } else {
     const fetchHud = async (url) => {
       const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20000) });

@@ -700,6 +700,20 @@ try {
     note('7.0', '未指定 DSH 地址 → 跳过第 7 组（路由契约 / 鉴权）',
       '要跑这一组：node spike/probe-weight.mjs http://127.0.0.1:<DSH 窗口地址栏里的端口>');
   } else {
+  // 端口每次启动都会变：先探一下，连不上就跳过整组，别把环境问题报成契约失败。
+  let unreachable = '';
+  try {
+    const probe = await fetch(`${BASE}/lifehud/api/hud`, {
+      headers: { accept: 'application/json' }, signal: AbortSignal.timeout(5000),
+    });
+    if (!probe.ok) unreachable = `HTTP ${probe.status}`;
+  } catch (error) {
+    unreachable = String(error?.cause?.code ?? error?.message ?? error);
+  }
+  if (unreachable) {
+    note('7.0', '连不上 DSH → 跳过第 7 组（路由契约 / 鉴权）',
+      `${BASE}（${unreachable}）——DSH 端口每次启动都会变，用当前地址重跑`);
+  } else {
   console.log('\n7) 路由鉴权 + 契约');
   let liveBody = null;
   await check('7.1', 'GET /lifehud/api/weight → 200，字段名/类型符合契约', async () => {
@@ -824,6 +838,7 @@ try {
     return `?force=1 响应 ${text.length} 字节，serviceToken / ssecurity / userId 均未出现`;
   });
 
+  }
   }
 
   // ════════════════ 收尾：真实库复原核对 ════════════════

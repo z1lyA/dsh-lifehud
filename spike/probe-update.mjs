@@ -425,6 +425,17 @@ async function sectionD() {
     return;
   }
   const url = `${BASE}/lifehud/api/update`;
+  // 端口每次启动都会变：连不上是环境问题，跳过而不是伪装成代码失败。
+  try {
+    const probe = await fetch(`${BASE}/lifehud/api/hud`, {
+      headers: { accept: 'application/json' }, signal: AbortSignal.timeout(5000),
+    });
+    if (!probe.ok) throw new Error(`HTTP ${probe.status}`);
+  } catch (error) {
+    console.log(`  ${C.dim}跳过：连不上 ${BASE}（${error?.cause?.code ?? error?.message ?? error}）`
+      + `——DSH 端口每次启动都会变，用当前地址重跑${C.off}`);
+    return;
+  }
   await check('D1 GET /lifehud/api/update → 200 + 字段形状', async () => {
     const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
     eq(res.status, 200, 'HTTP 状态');

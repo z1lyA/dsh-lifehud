@@ -270,6 +270,9 @@ try {
     console.log('heatmap :', real.heatmap.filter((d) => d.m > 0).length, '天有数据');
     console.log('warnings:', real.warnings);
     console.log('capture :', JSON.stringify(real.capture));
+    // 这个进程没有 apply() / startCollector()，capture.running 恒为 false；
+    // 真实采集器状态要看宿主进程的 /lifehud/api/hud，不能拿这行当「采集挂了」。
+    console.log('          （capture 来自本探针进程：没启动采集器；真实状态看 /lifehud/api/hud）');
     check('真实库：专注卡可用', real.focus.available === true);
     check('真实库：top 非空', (real.focus.top ?? []).length > 0,
       (real.focus.top ?? []).map((a) => a.app).join(', '));
