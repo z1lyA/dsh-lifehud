@@ -25,7 +25,17 @@ const RULES = [
   { name: 'GitHub token', re: /gh[pousr]_[A-Za-z0-9]{20,}/ },
 ];
 /** 只在"文件存在"层面检查（内容里提到文件名是正常的）。 */
-const FORBIDDEN_FILES = ['mi-session.json', 'lifehud-weight.db', 'lifehud-settings.json', 'lifehud-photo.bin'];
+const FORBIDDEN_FILES = [
+  'mi-session.json',
+  'lifehud-weight.db',
+  'lifehud-weight.db-wal',
+  'lifehud-weight.db-shm',
+  'lifehud-settings.json',
+  'lifehud-photo.bin',
+  'capture.db',
+  'capture.db-wal',
+  'capture.db-shm',
+];
 
 function walk(dir, out = []) {
   for (const name of readdirSync(dir)) {

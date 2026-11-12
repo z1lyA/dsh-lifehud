@@ -185,7 +185,6 @@ async function sectionC() {
   await check('C1 Release 命中：latest / source / url / notes', async () => {
     const calls = [];
     const result = await readUpdate({ updateRepo: repoOf('release-hit') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(200, releaseBody('v99.0.0', { body: '新版本说明' })) }, calls),
     });
     eq(result.latest, '99.0.0', 'latest');
@@ -202,7 +201,6 @@ async function sectionC() {
   await check('C2 请求头只有身份，没有凭据', async () => {
     const calls = [];
     await readUpdate({ updateRepo: repoOf('headers') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(404) , '/tags': jsonResponse(200, []) }, calls),
     });
     const headers = calls[0]?.init?.headers ?? {};
@@ -214,7 +212,6 @@ async function sectionC() {
   await check('C3 Release 404 → 回退 tags，并取最大版本（不取第一个）', async () => {
     const calls = [];
     const result = await readUpdate({ updateRepo: repoOf('tags-fallback') }, {
-      force: true,
       fetchImpl: fakeFetch({
         'releases/latest': jsonResponse(404),
         '/tags': jsonResponse(200, [{ name: 'v9.0.0' }, { name: 'v9.2.0' }, { name: 'v9.1.0' }]),
@@ -229,7 +226,6 @@ async function sectionC() {
 
   await check('C4 tags 里的非版本名被忽略', async () => {
     const result = await readUpdate({ updateRepo: repoOf('tags-junk') }, {
-      force: true,
       fetchImpl: fakeFetch({
         'releases/latest': jsonResponse(404),
         '/tags': jsonResponse(200, [{ name: 'nightly' }, { name: 'v9.0.0' }, { name: 'latest' }]),
@@ -241,7 +237,6 @@ async function sectionC() {
 
   await check('C5 Release 的 tag 不是版本号 → 继续回退 tags', async () => {
     const result = await readUpdate({ updateRepo: repoOf('release-junk') }, {
-      force: true,
       fetchImpl: fakeFetch({
         'releases/latest': jsonResponse(200, releaseBody('nightly')),
         '/tags': jsonResponse(200, [{ name: 'v9.3.0' }]),
@@ -254,7 +249,6 @@ async function sectionC() {
 
   await check('C6 Release 缺 html_url 时自己拼发布页地址', async () => {
     const result = await readUpdate({ updateRepo: repoOf('no-html-url') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(200, { tag_name: 'v9.9.9' }) }, []),
     });
     eq(result.url, 'https://github.com/probe/no-html-url/releases/tag/v9.9.9', 'url');
@@ -263,7 +257,6 @@ async function sectionC() {
 
   await check('C7 Release 正文截断到 400 字', async () => {
     const result = await readUpdate({ updateRepo: repoOf('notes') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(200, releaseBody('v99.0.0', { body: 'x'.repeat(1000) })) }, []),
     });
     eq(result.notes.length, 400, 'notes 长度');
@@ -272,7 +265,6 @@ async function sectionC() {
 
   await check('C8 远端没有可识别版本 → reason=no-tags，不报错', async () => {
     const result = await readUpdate({ updateRepo: repoOf('no-tags') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(404), '/tags': jsonResponse(200, [{ name: 'nightly' }]) }, []),
     });
     eq(result.latest, null, 'latest');
@@ -286,7 +278,6 @@ async function sectionC() {
   await check('C9 403 限流：reason=rate-limited，且不再打 tags', async () => {
     const calls = [];
     const result = await readUpdate({ updateRepo: repoOf('rate') }, {
-      force: true,
       fetchImpl: fakeFetch({
         'releases/latest': jsonResponse(403, { message: 'rate limit' }, { 'x-ratelimit-remaining': '0' }),
       }, calls),
@@ -299,7 +290,6 @@ async function sectionC() {
 
   await check('C10 网络抛错：reason=network', async () => {
     const result = await readUpdate({ updateRepo: repoOf('offline') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': new Error('getaddrinfo ENOTFOUND api.github.com') }, []),
     });
     eq(result.reason, 'network', 'reason');
@@ -311,7 +301,6 @@ async function sectionC() {
     const timeout = new Error('The operation was aborted');
     timeout.name = 'TimeoutError';
     const result = await readUpdate({ updateRepo: repoOf('timeout') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': timeout }, []),
     });
     eq(result.reason, 'timeout', 'reason');
@@ -320,7 +309,6 @@ async function sectionC() {
 
   await check('C12 返回坏 JSON：reason=bad-payload', async () => {
     const result = await readUpdate({ updateRepo: repoOf('bad-json') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(200, new SyntaxError('Unexpected token <')) }, []),
     });
     eq(result.reason, 'bad-payload', 'reason');
@@ -329,7 +317,6 @@ async function sectionC() {
 
   await check('C13 tags 形状不对：reason=bad-payload', async () => {
     const result = await readUpdate({ updateRepo: repoOf('bad-tags') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(404), '/tags': jsonResponse(200, { message: 'nope' }) }, []),
     });
     eq(result.reason, 'bad-payload', 'reason');
@@ -338,7 +325,6 @@ async function sectionC() {
 
   await check('C13b tags 也 404：reason=not-found（仓库不存在）', async () => {
     const result = await readUpdate({ updateRepo: repoOf('gone') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(404), '/tags': jsonResponse(404) }, []),
     });
     eq(result.reason, 'not-found', 'reason');
@@ -348,11 +334,9 @@ async function sectionC() {
   await check('C14 失败时保留上一次成功结果（stale + checkedAt 不变）', async () => {
     const repo = repoOf('stale');
     const first = await readUpdate({ updateRepo: repo }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': jsonResponse(200, releaseBody('v99.0.0')) }, []),
     });
     const second = await readUpdate({ updateRepo: repo }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': new Error('offline') }, []),
     });
     eq(second.latest, '99.0.0', '保留上次 latest');
@@ -364,7 +348,6 @@ async function sectionC() {
 
   await check('C15 从未成功过：latest=null + stale', async () => {
     const result = await readUpdate({ updateRepo: repoOf('never') }, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': new Error('offline') }, []),
     });
     eq(result.latest, null, 'latest');
@@ -376,7 +359,6 @@ async function sectionC() {
   await check('C16 updateCheck:false → 一次网络都不打', async () => {
     const calls = [];
     const result = await readUpdate({ updateRepo: repoOf('disabled'), updateCheck: false }, {
-      force: true,
       fetchImpl: fakeFetch({}, calls),
     });
     eq(result.reason, 'disabled', 'reason');
@@ -387,7 +369,6 @@ async function sectionC() {
   await check('C17 updateRepo 非法 → bad-repo，不拼 URL', async () => {
     const calls = [];
     const result = await readUpdate({ updateRepo: 'https://evil.example/x' }, {
-      force: true,
       fetchImpl: fakeFetch({}, calls),
     });
     eq(result.reason, 'bad-repo', 'reason');
@@ -395,21 +376,19 @@ async function sectionC() {
     return '非法 repo · 0 次请求';
   });
 
-  await check('C18 TTL 内复用结果；force=1 才重新打网络', async () => {
-    const repo = repoOf('ttl');
+  await check('C18 没有 TTL 缓存：每次点都真打一次网络', async () => {
+    const repo = repoOf('no-ttl');
     const calls = [];
     const fetchImpl = fakeFetch({
       'releases/latest': jsonResponse(404),
       '/tags': jsonResponse(200, [{ name: 'v99.0.0' }]),
     }, calls);
-    const first = await readUpdate({ updateRepo: repo }, { force: true, fetchImpl });
-    const cached = await readUpdate({ updateRepo: repo }, { fetchImpl });
-    eq(calls.length, 2, 'TTL 内的第二次调用不应发请求');
-    eq(cached.latest, first.latest, '缓存内容应一致');
-    eq(cached.cached, true, '缓存标记');
-    await readUpdate({ updateRepo: repo }, { force: true, fetchImpl });
-    eq(calls.length, 2 + 2, 'force 后重新请求');
-    return '缓存命中 0 请求；force 重新请求';
+    const first = await readUpdate({ updateRepo: repo }, { fetchImpl });
+    const second = await readUpdate({ updateRepo: repo }, { fetchImpl });
+    eq(calls.length, 4, '两次调用应各打一次（release 404 + tags）× 2');
+    eq(second.latest, first.latest, '两次结果一致');
+    eq(second.stale, false, '第二次也不该是 stale');
+    return '两次调用 4 个请求（无缓存）';
   });
 
   await check('C19 并发检查共用一次请求（防连点）', async () => {
@@ -420,8 +399,8 @@ async function sectionC() {
     const fetchImpl = fakeFetch({
       'releases/latest': async () => { await gate; return jsonResponse(200, releaseBody('v99.0.0')); },
     }, calls);
-    const p1 = readUpdate({ updateRepo: repo }, { force: true, fetchImpl });
-    const p2 = readUpdate({ updateRepo: repo }, { force: true, fetchImpl });
+    const p1 = readUpdate({ updateRepo: repo }, { fetchImpl });
+    const p2 = readUpdate({ updateRepo: repo }, { fetchImpl });
     release();
     const [r1, r2] = await Promise.all([p1, p2]);
     eq(calls.length, 1, '并发两次只该有一个请求');
@@ -431,7 +410,6 @@ async function sectionC() {
 
   await check('C20 返回值永远是对象，不抛异常', async () => {
     const result = await readUpdate({}, {
-      force: true,
       fetchImpl: fakeFetch({ 'releases/latest': new Error('boom') }, []),
     });
     assert(result && typeof result === 'object' && result.ok === true, '应返回 ok:true 的降级快照');
@@ -448,7 +426,7 @@ async function sectionD() {
   }
   const url = `${BASE}/lifehud/api/update`;
   await check('D1 GET /lifehud/api/update → 200 + 字段形状', async () => {
-    const res = await fetch(`${url}?force=1`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
+    const res = await fetch(url, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(20000) });
     eq(res.status, 200, 'HTTP 状态');
     const body = await res.json();
     eq(body.ok, true, 'ok');
@@ -473,7 +451,7 @@ async function sectionE() {
     return;
   }
   await check('E1 真打 GitHub（只读，不发送本机信息）', async () => {
-    const result = await readUpdate({ updateRepo: 'z1lyA/dsh-lifehud' }, { force: true });
+    const result = await readUpdate({ updateRepo: 'z1lyA/dsh-lifehud' });
     assert(result.ok === true, 'ok');
     assert(result.reason === null || ['no-tags', 'network', 'rate-limited', 'timeout', 'bad-payload'].includes(result.reason),
       `reason 意外：${result.reason}`);

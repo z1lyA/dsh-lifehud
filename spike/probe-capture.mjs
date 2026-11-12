@@ -13,7 +13,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
-  startCollector, appendSample, captureStatus, openCaptureDb, importHistory, readOwnActivity,
+  startCollector, appendSample, captureStatus, openCaptureDb, importHistory, readOwnActivity, flushCapture,
 } from '../plugin/index.js';
 
 const results = [];
@@ -401,6 +401,69 @@ try {
 }
 
 /* ---------------------------------------------- 汇总 */
+
+/**
+ * 第五段：写库事务回滚（fake state，不碰磁盘）。
+ * 回归的目标是一个真 Bug：事务回滚后，本轮 INSERT 得到的 rowId 已经不存在，
+ * 如果不把它清掉，下一轮 flush 会走 UPDATE 命中 0 行（SQLite 不报错）→ 这一段静默丢失。
+ */
+console.log('\n--- E. 写库事务回滚（fake state） ---');
+
+/** @param {{failOnCommit?:boolean}} [options] */
+function fakeCaptureState(options = {}) {
+  const segment = { rowId: null, bucketId: 'probe-bucket', data: '{"app":"probe.exe"}', startMs: 1000, endMs: 4000 };
+  const state = {
+    db: {
+      exec(sql) {
+        if (options.failOnCommit && sql === 'COMMIT') throw new Error('disk I/O error');
+      },
+    },
+    insertStmt: { run: () => ({ lastInsertRowid: 7 }) },
+    updateStmt: { run: () => {} },
+    pending: [],
+    open: new Map([['probe-bucket', segment]]),
+    rows: 0,
+    lastFlushAt: null,
+    lastError: null,
+  };
+  return { state, segment };
+}
+
+{
+  const { state, segment } = fakeCaptureState();
+  const written = flushCapture(state);
+  check('E1 正常落盘：未闭合段拿到 rowId、计数正确',
+    written === 1 && segment.rowId === 7 && state.rows === 1 && state.lastError === null,
+    `written=${written} rowId=${segment.rowId} rows=${state.rows}`);
+}
+
+{
+  const { state, segment } = fakeCaptureState({ failOnCommit: true });
+  const written = flushCapture(state);
+  check('E2 回滚后 segment.rowId 必须清空（否则下一轮 UPDATE 命中 0 行、静默丢数据）',
+    written === 0 && segment.rowId === null && typeof state.lastError === 'string',
+    `written=${written} rowId=${segment.rowId} lastError=${state.lastError}`);
+}
+
+{
+  const { state } = fakeCaptureState({ failOnCommit: true });
+  const row = { rowId: null, bucketId: 'probe-bucket', ts: new Date(0).toISOString(), duration: 3, data: '{}' };
+  state.pending.push(row);
+  const written = flushCapture(state);
+  check('E3 回滚后闭合行重新排队、rowId 清空（下一轮会重新 INSERT）',
+    written === 0 && state.pending.length === 1 && state.pending[0].rowId === null,
+    `written=${written} pending=${state.pending.length} rowId=${state.pending[0]?.rowId}`);
+}
+
+{
+  // 已经存在于库里的段（rowId 非空）在回滚时不该被清：它本来就写成功过。
+  const { state, segment } = fakeCaptureState({ failOnCommit: true });
+  segment.rowId = 5;
+  const written = flushCapture(state);
+  check('E4 回滚不误伤已存在的 rowId（老行只 UPDATE，不会重复 INSERT）',
+    written === 0 && segment.rowId === 5,
+    `written=${written} rowId=${segment.rowId}`);
+}
 
 const failed = results.filter((r) => !r.pass);
 console.log(`\n${'='.repeat(60)}`);
