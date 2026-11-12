@@ -41,6 +41,16 @@ plugin_manager({ action: 'install_bundle', target: '<本仓库路径>/plugin' })
 
 安装后刷新页面即生效。**改 Host 代码（`plugin/index.js`）需要 `remove_bundle` → `install_bundle` 重新加载；改 Client（`plugin/client.js`）只需刷新页面。**
 
+## 检查更新（v1.1.2）
+
+页面「设置 → 版本与更新」里有一个「检查更新」按钮：点一下才知道远端有没有新版本，**不会自动联网**。
+
+- 数据源：公开仓库 `z1lyA/dsh-lifehud` 的 GitHub Release / Tag（只读）。有 Release 就显示发布页与正文，没有就回退到 tags 取最大的 `vX.Y.Z`。
+- 只带 `user-agent: dsh-lifehud/<版本>`，不带账号、设备号或 token；结果只缓存在内存（6 小时），不落盘。
+- 同时显示 Host 版本与页面资源版本；两者不一致会提示按 `Ctrl+R`，避免「Host 升级了、浏览器还在跑旧代码」的假故障。
+- 升级步骤就写在弹窗里：`git pull` → `plugin_manager` remove_bundle → install_bundle → 刷新页面。
+- 离线、超时、GitHub 限流、仓库名写错都有中文提示，并保留上一次查到的结果（标 `stale`）。
+
 ## 配置
 
 数据源路径写在 `plugin/cordis.patch.yml` 的 `config` 里：
@@ -62,6 +72,9 @@ plugin_manager({ action: 'install_bundle', target: '<本仓库路径>/plugin' })
 | `storeTitles` | `true` | 是否落库窗口标题；`false` 只存应用名（更隐私） |
 | `historyImport` | `'once'` | `'never'` 表示不迁移 ActivityWatch 历史 |
 | `historySource` | 自动推导 | ActivityWatch 库路径，正常情况不用填 |
+| `updateCheck` | `true` | `false` 完全关掉检查更新（不联网，路由返回 `disabled`） |
+| `updateRepo` | `z1lyA/dsh-lifehud` | 检查哪个仓库；fork 时改成自己的 `owner/name` |
+| `updateTtlMs` | `21600000` | 检查结果缓存 6 小时（只有手动点按钮才联网） |
 
 天气位置也可以在页面「设置」里点「使用我的位置」自动写入。
 体重卡、「专注卡采集」两个开关都在「设置」里（存 localStorage，与其它界面设置同一套）。
@@ -97,6 +110,7 @@ AGENTS.md      给接手 AI 的协作手册（含所有踩过的坑）
 - HUD 快照（任务/天气/会话/专注/热力）现在每 **5 分钟**自动刷新一次（页面隐藏时不拉，回到页面补一次）；体重仍由 Host 每 10 分钟自动同步。
 - 专注数据**只在 DSH 运行期间采集**：DSH 关着的时间段没有数据（7×24 采集不做）。
 - 「专注卡采集」开关目前只影响**展示**，Host 还在继续采集（真正停采是 1.2 的事）。
+- **检查更新只在手动点按钮时联网**（这是刻意的：不想让页面加载时替你发请求）；GitHub 未登录限流 60 次/小时，限流时会显示提示并沿用上次结果。插件是 `link:` 安装，所以升级要 `git pull` + 重装，没有「点一下自动更新」。
 - 小米云会话过期后要**手动重新登录一次**才能续上（卡片会红字提示，历史数据不丢）——步骤见 [`docs/小米云取数.md`](docs/小米云取数.md)。
 - 布局是 flex 便当盒：第一行 天气 / 体重 / 任务，第二行 专注 / 会话 / 相框 / 热力，不做瀑布流。
 

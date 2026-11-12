@@ -12,7 +12,7 @@
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
 | 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 45 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项） |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 45 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
 | 认识专注卡那条链路 | 本文件 §7「专注卡怎么工作」+ `plugin/collector.ps1`，代码入口 `startCollector()` / `readOwnActivity()` |
@@ -85,6 +85,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 | 专注 / 热力 | **自采集**：`plugin/collector.ps1` → `<dataDir>/capture.db` | Host spawn 长驻 PowerShell 子进程，stdout 每 2 秒一行 JSON；Host 合并成带 `duration` 的事件写库；页面只读库 | 零安装（PowerShell 5.1 + C# P/Invoke）；`storeTitles:false` 只存应用名；**AFK 区间必须从窗口事件里扣掉**，否则 explorer.exe 会占几百分钟；采集器只能由 Host 启停（见 §6 孤儿进程） |
 | ActivityWatch（历史） | `%LOCALAPPDATA%\activitywatch\activitywatch\aw-server\peewee-sqlite.v2.db` | 只在 **首次迁移** 时读一次文件（先复制含 -wal/-shm 的副本到 tmpdir 再只读打开），把全部 bucket + `events.data` 原始 JSON + `settings.json` 的 `classes` 搬进 `capture.db` | **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**——用 id 文本查会静默返回 0 行；迁移幂等（`meta.history_imported`）；运行期**零 AW 依赖** |
 | 体重 | 小米云 `https://api.io.mi.com/app/user/get_user_device_data` | POST，`type=weight` / `key=bodyInfo` / `group=raw`，**时间单位是秒**；RC4 签名 + 会话文件 | 会话默认读 `<dataDir>/mi-session.json`（**不进 git**）；设备号**自动发现**（`/home/device_list` 里 model 带 `scales` 的那台），不写死；`weightId` 必须按 TEXT 存；Host 每 10 分钟自动同步，`?force=1` 跳过 TTL。细节见 `docs/小米云取数.md` |
+| 检查更新（v1.1.2） | GitHub REST：`/repos/<owner>/<repo>/releases/latest`，404 时回退 `/tags?per_page=30` | 只在页面手动点「检查更新」时请求；`user-agent: dsh-lifehud/<版本>`，不带任何凭据 | 取 tags 里**最大**的语义版本，不取第一个；结果只缓存在 Host 内存（`updateTtlMs` 默认 6 小时），不落盘；失败返回 `stale` 快照，从不抛给页面 |
 
 ## 5. 约定（照做）
 
@@ -133,6 +134,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - ✅ 开机预热：Host `apply()` 里先跑一次 `buildHud` + `readWeight`；Client 加载时 `fetchHud()` / `fetchWeight()` 预取。
 - ✅ HUD 自动刷新（v1.1.1）：Client `useHud()` 每 5 分钟静默重取一次（页面隐藏时不发请求，`visibilitychange` 回页面补一次；三道护栏防并发：hidden / `prefetch` 在飞 / `HUD_TTL` 未过期都跳过）。
 - ✅ 体重同步：Host 每 10 分钟自动拉一次小米云（定时器可 dispose）；页面「刷新」按钮带 `?force=1` 立即拉，**这是"刚踩秤就能看到"的主路径**。
+- ✅ 检查更新（v1.1.2）：页面「设置 → 版本与更新」手动点才联网（**不做启动自动检查**）；Host 读 GitHub Release/Tag，取最大语义版本；`/hud` 新增 `version` 字段（Host 版本），页面拿它和 `BUILD` 对比提示「页面资源旧了」；上次结果存 localStorage（键 `lifehud.update.v1`，版本变了自动作废）。
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
 - ⚠️ 天气的"一句话"是规则拼的，不是模型生成。
 
@@ -215,6 +217,7 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
 4. **专注卡详情页（1.2）**：`capture.db` 已经留好料——`events.data` 是原始 JSON（app/title/status 一个字段不丢）、`meta.aw_classes` 存了 16 条分类正则、`source` 能区分 `live` / `aw-migrated`。可算：应用占比/趋势、切换次数与碎片化指数、标题 Top、24h 节律、AFK 比例、按 `classes` 的分类饼图。
 5. 专注卡「关掉=真停采」：目前开关只影响展示（Host 仍在采集），要做需要 Client → Host 的通道（比如 `POST /lifehud/api/capture {enabled}`）。
 6. 热力日历换指标（当前是本地采集库的每日活跃分钟；token 需自建日表）。
+7. 检查更新「自动查/后台查」：现在刻意是手动（用户 2026-11-12 的选择）；若要改成启动自动查或发现新版弹提示，先跟用户确认联网频率。
 
 ## 9. 与用户协作的方式
 

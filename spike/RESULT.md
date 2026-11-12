@@ -211,3 +211,36 @@ AFK 区间不精确切分到事件内部，按占比摊到整段——**热力�
 - **AW 历史里有一条病态事件**：`msedge` 单条 25.1 小时（AW 当年停摆造成）。迁移忠实保留（一个字段不丢），但它会压低 11-07 / 11-08 的热力；详情页做统计时应给单条事件设上限。
 - **HMR 顺序边界**：若某个宿主先激活新 ctx、后 dispose 旧 ctx，旧 disposer 可能把采集器停掉（`stopCapture` 只停自己那一个 state，但同一模块实例下两次 `apply` 共享单例）。实测 `remove → install` 两次都正常；正常升级不受影响。
 
+---
+
+## v1.1.2 检查更新（2026-11-12）
+
+- **目标**：页面里能手动查一次「远端有没有新版本」，并给出可照做的升级步骤；不自动联网、不引依赖、失败不打扰页面。
+- **做法**：Host 新增 `GET /lifehud/api/update`（loopback only）→ GitHub REST：先 `/releases/latest`，404 就回退 `/tags?per_page=30`，取**最大**语义版本 → Client「设置 → 版本与更新」手动点按钮（`?force=1`），结果写 localStorage 供下次打开时回看。
+- **验证**：`spike/probe-update.mjs`（30 项确定性 + 2 项 HTTP；`--live` 再真打一次 GitHub）。
+
+### 为什么这么设计（取舍）
+
+1. **用 tag 而不是新增 `version.json`**：发版流程本来就要打 tag（AGENTS §10），不需要多一个人工步骤，也不会出现「文件忘了更新」的漂移。Release 有就顺便拿正文与发布页，没有就只显示 tag。
+2. **只有手动点才联网**：用户 2026-11-12 明确选择「默认不自动检查」。Host 侧因此没有启动预热、没有定时器；`updateTtlMs`（6 小时）只服务连续点按与重开设置。
+3. **不自动下载/安装**：插件是 `link:` 安装，升级必须 `git pull` + `plugin_manager` remove/install；没有安全的自更新通道。页面只给步骤，不假装能一键升级。
+4. **失败也是 200 快照**：沿用体重链路的 `stale + reason` 契约，页面永远有东西可显示；`reason` 是稳定码（`network / timeout / rate-limited / not-found / bad-payload / bad-repo / no-tags / disabled`），中文翻译在 Client。
+5. **本地比远端新要有独立状态**（`ahead`）：发版当天本地已经 1.1.2、远端 tag 还没推，这时若只按「不等」判断就会误报「有新版本」。
+
+### 实测 / 边界
+
+| 项 | 值 |
+|---|---|
+| 真实仓库状态（2026-11-12） | `/releases/latest` → **404**（还没有 Release）；`/tags` → `v1.1.1`、`v1.1.0`，取最大得 1.1.1；真网络 E1 通过 |
+| 未登录限流 | 实测响应头剩 59/60 次；403 + `x-ratelimit-remaining: 0` 归为 `rate-limited`，不会继续打 tags |
+| 探针覆盖 | 版本解析/比较、跨文件版本一致（package.json ↔ client BUILD）、release 命中、404 回退、乱序 tags 取最大、非法 tag、坏 JSON、403、超时、离线、TTL 缓存、force、并发单飞、stale 保留、disabled、非法 repo、HTTP 200/405 |
+| 未覆盖 | 浏览器端的实际点按（由页面验收）；`release` 分支只在注入的 fake 响应里验过（仓库当前没有 Release）；20 秒以上的真实网络抖动 |
+
+### 已知限制
+
+- 检查结果只缓存在 Host 内存，重启后第一次点按钮会重新打网络（2 个请求以内）。
+- 只认 `vX.Y.Z` 形状的 tag；`nightly` 之类的名字会被跳过（当前发版流程全是正式 tag）。
+- 未做 ETag/条件请求；正常使用频率（手动 + 6 小时缓存）远低于未登录 60 次/小时。
+- 浏览器的「上次检查结果」按 Host 版本作废：插件升级后需要重新点一次，避免拿旧结论误导。
+
+
