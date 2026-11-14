@@ -146,6 +146,14 @@ function newestDates(dbPath, n) {
   } finally { db.close(); }
 }
 
+/** 副本库里某个 meta 键的值（没有就当空串）。 */
+function readMetaValue(dbPath, key) {
+  const db = dbOpen(dbPath);
+  try {
+    return db.prepare('SELECT value FROM meta WHERE key = ?').get(key)?.value ?? '';
+  } finally { db.close(); }
+}
+
 function prepareCopyDb(name) {
   const target = t(name);
   copyFileSync(REAL_DB, target);
@@ -655,6 +663,46 @@ try {
     eq(snap.reason, 'session-expired', `reason（error=${snap.error}）`);
     eq(snap.points.length, 7, '本地曲线');
     return `200 + SERVICETOKEN_EXPIRED + 空 result → reason=session-expired（不再是「云返回 0 条」）`;
+  });
+
+  await check('5.17', '设备指纹稳定：连续两次打云上报同一个 deviceId / UA（原来每次请求都换）', async () => {
+    const copy = prepareCopyDb('device-id.db');
+    const realFetch = globalThis.fetch;
+    const seen = [];
+    globalThis.fetch = async (url, init = {}) => {
+      const cookie = String(init.headers?.cookie ?? '');
+      seen.push({
+        deviceId: /(?:^|;\s*)deviceId=([^;]+)/.exec(cookie)?.[1] ?? '',
+        ua: String(init.headers?.['User-Agent'] ?? ''),
+      });
+      return {
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify({ code: 0, result: [] }),
+      };
+    };
+    try {
+      await readWeight({ ...realConfig, weightDb: copy }, { force: true });
+      await readWeight({ ...realConfig, weightDb: copy }, { force: true });
+    } finally { globalThis.fetch = realFetch; }
+
+    eq(seen.length, 2, '打云次数');
+    assert(/^[a-z]{6}$/.test(seen[0].deviceId), `deviceId 形状不对：${seen[0].deviceId}`);
+    eq(seen[1].deviceId, seen[0].deviceId, '两次请求的 deviceId（必须一致，否则像一天冒出上百台新设备）');
+    eq(seen[1].ua, seen[0].ua, '两次请求的 User-Agent（同一台手机不该换机型串）');
+    // 持久化：跨 DSH 重启也不该变，所以必须落在体重库 meta 里
+    const meta = readMetaValue(copy, 'miDeviceId');
+    assert(/^[a-z]{6}$/.test(String(meta)), `meta.miDeviceId 没落库：${meta}`);
+    return `两次请求均为 deviceId=${seen[0].deviceId}，UA 尾串一致，meta.miDeviceId=${meta}`;
+  });
+
+  await check('5.18', '设备指纹不是每次现生成（源码守卫：不再有 deviceId: randomDeviceId()）', async () => {
+    const src = readFileSync(join(REPO, 'plugin', 'lib', 'weight.js'), 'utf8');
+    assert(/deviceId:\s*miDeviceIdOf\(config\)/.test(src), '没找到 deviceId: miDeviceIdOf(config)');
+    assert(!/deviceId:\s*randomDeviceId\(\)/.test(src), '仍存在 deviceId: randomDeviceId()（每次请求换新设备号）');
+    assert(!/deviceId:\s*miDeviceId\(\)/.test(src), '仍存在旧的 deviceId: miDeviceId() 写法');
+    assert(/writeMetaText\(dbPath, 'miDeviceId'/.test(src), '设备号没有持久化到 meta');
+    return 'deviceId 走 miDeviceIdOf(config) + 落 meta，旧的一次性随机写法已不存在';
   });
 
   // ════════════════ 6. TTL / force ════════════════

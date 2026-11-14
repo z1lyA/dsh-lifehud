@@ -142,9 +142,50 @@ function miEncParams(url, method, signedNonce, nonce, params, ssecurity) {
   return params;
 }
 
-/** 随机 UA 尾巴，装作米家 Android 客户端（与 cloud_probe.py 同款）。 */
-const miAgent = () => Array.from({ length: 13 }, () => 'ABCDEF'[Math.floor(Math.random() * 6)]).join('');
-const miDeviceId = () => Array.from({ length: 6 }, () => 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)]).join('');
+/** 随机 UA 尾巴 / 设备号，装作米家 Android 客户端（与 cloud_probe.py 同款）。 */
+const randomAgent = () => Array.from({ length: 13 }, () => 'ABCDEF'[Math.floor(Math.random() * 6)]).join('');
+const randomDeviceId = () => Array.from({ length: 6 }, () => 'abcdefghijklmnopqrstuvwxyz'[Math.floor(Math.random() * 26)]).join('');
+
+/**
+ * 冒充同一台手机的 UA 尾巴。**进程内只生成一次**：同一台手机不该每次请求都换机型串。
+ * （参考实现 Xiaomi-cloud-tokens-extractor 也是 `__init__` 里生成一次后一直复用。）
+ */
+let miAgentOnce = '';
+
+/** 进程内缓存的设备指纹；跨重启靠体重库 meta 持久化。 */
+let miDeviceOnce = '';
+
+/**
+ * 这台机器对小米云的「机身号」，必须是**稳定的**。
+ *
+ * 曾经的写法是每次请求现生成一个新的随机 6 位 id。配合 Host 每 10 分钟 sync 一次，
+ * 等于同一个账号同一天冒出来 144 台「不同设备」——在小米风控眼里这就是盗号特征，
+ * 很可能就是 2026-11-14 那次令牌只活了 7 天就被掐掉的原因（见 AGENTS.md §6）。
+ *
+ * 口径：首次用到时生成一次 → 写进体重库 meta（`miDeviceId`）→ 之后所有请求复用，
+ * 连 DSH 重启都不变。写库失败（只读/被锁）就只在内存里固定，至少进程内一致。
+ * @param {object} config bundle row config
+ * @returns {string} 6 位小写字母
+ */
+function miDeviceIdOf(config) {
+  if (miDeviceOnce) return miDeviceOnce;
+  const dbPath = weightDbPath(config);
+  let id = dbPath ? readMetaText(dbPath, 'miDeviceId') : '';
+  if (!/^[a-z]{6}$/.test(id)) {
+    id = randomDeviceId();
+    if (dbPath) {
+      try { writeMetaText(dbPath, 'miDeviceId', id); } catch { /* 写不进去：内存里固定也够用 */ }
+    }
+  }
+  miDeviceOnce = id;
+  return id;
+}
+
+/** @returns {string} 冒充米家客户端的 User-Agent（进程内固定） */
+function miUserAgent() {
+  if (!miAgentOnce) miAgentOnce = randomAgent();
+  return `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${miAgentOnce} APP/com.xiaomi.mihome APPV/10.5.201`;
+}
 
 /**
  * 读会话文件（只读，绝不写回、绝不打印）。
@@ -203,11 +244,12 @@ function miBodyMessage(text) {
 
 /**
  * `POST /app/user/get_user_device_data`。响应可能是明文 JSON，也可能是 RC4 密文。
+ * @param {object} config bundle row config（只为拿稳定的设备指纹）
  * @param {object} session @param {object} data request body
  * @param {string} [path] 小米云路径，默认取称重记录端点
  * @returns {Promise<object>} parsed payload
  */
-async function miDeviceData(session, data, path = MI_DEVICE_DATA_PATH) {
+async function miDeviceData(config, session, data, path = MI_DEVICE_DATA_PATH) {
   const url = MI_BASE + path;
   const nonce = miNonce();
   const ssecurity = session.ssecurity;
@@ -216,7 +258,7 @@ async function miDeviceData(session, data, path = MI_DEVICE_DATA_PATH) {
 
   const cookies = {
     sdkVersion: '3.8.6',
-    deviceId: miDeviceId(),
+    deviceId: miDeviceIdOf(config),
     userId: session.userId,
     yetAnotherServiceToken: session.serviceToken,
     serviceToken: session.serviceToken,
@@ -232,7 +274,7 @@ async function miDeviceData(session, data, path = MI_DEVICE_DATA_PATH) {
     response = await fetch(url, {
       method: 'POST',
       headers: {
-        'User-Agent': `Android-7.1.1-1.0.0-ONEPLUS A3010-136-${miAgent()} APP/com.xiaomi.mihome APPV/10.5.201`,
+        'User-Agent': miUserAgent(),
         'Accept-Encoding': 'identity',
         'x-xiaomi-protocal-flag-cli': 'PROTOCAL-HTTP2',
         'content-type': 'application/x-www-form-urlencoded',
@@ -325,7 +367,7 @@ async function resolveMiDid(config, session) {
   const cached = dbPath ? readMetaText(dbPath, 'miDid') : '';
   if (cached) return cached;
 
-  const payload = await miDeviceData(session, { getVirtualModel: false, getHuamiDevices: 1 }, MI_DEVICE_LIST_PATH);
+  const payload = await miDeviceData(config, session, { getVirtualModel: false, getHuamiDevices: 1 }, MI_DEVICE_LIST_PATH);
   const code = Number(payload?.code ?? 0);
   if (code !== 0) {
     const expired = code === 70016 || code === -1 || code === 401;
@@ -351,7 +393,7 @@ async function pullWeight(config) {
   const session = readMiSession(miSessionPath(config));
   const did = String(config.miDid ?? '') || await resolveMiDid(config, session);
   const now = Math.floor(Date.now() / 1000);
-  const payload = await miDeviceData(session, {
+  const payload = await miDeviceData(config, session, {
     did,
     uid: session.userId,
     type: 'weight',
