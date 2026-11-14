@@ -279,4 +279,19 @@ AFK 区间不精确切分到事件内部，按占比摊到整段——**热力�
 - 空闲强度已落库但页面未展示；留在 [`docs/BACKLOG.md`](docs/BACKLOG.md) 的 1.2 候选里。
 - 明确不回改历史提交（S10，已 push，重写要 force push）。
 
+---
+
+## 小米云会话过期：426 误判 + 设备指纹（2026-11-14 ~ 11-15）
+
+- **现象**：体重卡红字「小米云返回异常」，`/lifehud/api/weight` 返回 `reason:"cloud"`、`error:"小米云 HTTP 426"`；曲线照常（本地缓存 7 个点），数据没丢。
+- **真因**：`HTTP 426` + `{"code":0,"message":"SERVICETOKEN_EXPIRED"}` —— 就是**会话过期**。对照实验把「是不是别的原因」排掉：
+  - 把 token 换成假的 → `401` + `{"code":2,"message":"auth error"}`，说明请求格式/签名没坏，真 token 是「认得但过期」；
+  - 同一会话打两个端点（`/home/device_list`、`/user/get_user_device_data`）→ 都是 426 同一句，是**会话级**失效而不是端点改版；
+  - 连跑多次结果一致（确定性）。
+- **缺陷 1：只看状态码判过期**。原实现只有 `401/403` 归 `session-expired`，426 掉进通用 `!ok` 分支成 `cloud` → 卡片说「云端异常」，用户不知道该重登。修法：`miDeviceData()` **先读 body 再判状态**，`miFailureReason()` 同时看状态码与响应体文本（`SERVICETOKEN_EXPIRED`），`error` 带出服务端消息；另补「HTTP 200 + 空 result + 该消息」的兜底，避免被当成「云回 0 条」静默降级。
+- **缺陷 2：设备指纹每次请求随机**。`deviceId` 原来是**每个请求**现摇 6 位随机串（UA 尾巴也随机），而 Host 每 10 分钟同步一次 → 一天 144 台「新手机」用同一账号，正是盗号风控特征；参考实现是进程序号生成一次。修法：`miDeviceIdOf(config)` 首次生成后写进体重库 `meta.miDeviceId` **永久复用**（DSH 重启不变），UA 尾巴进程内固定。**这一条是「令牌只活 7 天」的主要嫌疑，但未证伪，靠 §4.1 的观测表继续验。**
+- **重登工具**：新增 `notes/tools/mi-login.mjs`（本地、未发布）：申请登录入口 → 打印链接 + 二维码（300 秒有效）→ 手机确认 → 换 `serviceToken` → 写回 `mi-session.json`（旧文件先 `.bak-<时间戳>`）。协议要点：`sid=xiaomiio`、`callback` 必须是 `https://sts.api.io.mi.com/sts`（否则回 `code=10025 Callback连接不合法`）；确认后先 GET `location` 拿 cookie。**不碰密码、不装第三方程序。**
+- **验证**：`probe-weight` 离线 43 PASS / 0 FAIL / 5 INFO（48 项）、带 DSH 地址 52 PASS / 0 FAIL / 5 INFO。新增 5.13–5.16（失败分类）、5.17–5.18（设备指纹）。**5.17 先改回旧写法确认会红**（两次请求上报 `gkhnjp` / `ybnsev` 两个不同 id）再转绿。另修 5.7：原来打真云测「业务错误」，会话一过期就跟着红，已改 stub（判 `reason` 的用例不该混入会话状态）。
+- **结果**：重登后 `?force=1` → `stale:false`、`lastSyncAt` 更新、云端多回了一天（11-14），库内 50 行 / 42 个测量日，8.1 核对前后一致。
+
 
