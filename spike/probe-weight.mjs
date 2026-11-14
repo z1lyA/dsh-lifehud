@@ -488,12 +488,24 @@ try {
   });
 
   await check('5.7', 'reason 分类准确：云侧业务错误 → cloud（不是 session-expired）', async () => {
+    // 用 stub 而不是真实云：原来打「不存在的 did」等真服务返回业务错误，
+    // 但那样会**把会话状态混进断言**——token 过期时云回的是 426 SERVICETOKEN_EXPIRED，
+    // 这条用例就会因为另一个原因红/绿（2026-11-14 修 426 误判时才暴露出来）。
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      status: 200,
+      ok: true,
+      text: async () => JSON.stringify({ code: 1001, message: 'invalid did' }),
+    });
     const copy = prepareCopyDb('wrong-did.db');
-    const snap = await readWeight({ ...realConfig, weightDb: copy, miDid: 'blt.9.thisdevicecannotexist' }, { force: true });
+    let snap;
+    try {
+      snap = await readWeight({ ...realConfig, weightDb: copy, miDid: 'blt.9.thisdevicecannotexist' }, { force: true });
+    } finally { globalThis.fetch = realFetch; }
     eq(snap.stale, true, 'stale');
     eq(snap.reason, 'cloud', `reason（error=${snap.error}）`);
     assert(snap.points.length > 0, 'stale 时本地曲线应保留');
-    return `错误 did → stale=true reason=cloud points=${snap.points.length}（本地），error="${snap.error}"；没有误判成会话过期`;
+    return `云业务错误 code=1001 → stale=true reason=cloud points=${snap.points.length}（本地），error="${snap.error}"；没有误判成会话过期`;
   });
 
   await check('5.8', 'reason 分类准确：网络不可达 → network（stub fetch，不碰真网络）', async () => {
@@ -582,6 +594,67 @@ try {
     eq(snap.reason, 'cloud', `reason（error=${snap.error}）`);
     eq(snap.points.length, 7, '本地曲线');
     return `乱码响应 → stale=true reason=cloud points=${snap.points.length}，error="${snap.error?.slice(0, 34)}…"`;
+  });
+
+  await check('5.13', 'HTTP 426 + SERVICETOKEN_EXPIRED → reason=session-expired（2026-11-14 实测回归）', async () => {
+    const copy = prepareCopyDb('expired-426.db');
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      status: 426, ok: false, text: async () => '{"code":0,"message":"SERVICETOKEN_EXPIRED"}',
+    });
+    let snap;
+    try {
+      snap = await readWeight({ ...realConfig, weightDb: copy }, { force: true });
+    } finally { globalThis.fetch = realFetch; }
+    eq(snap.stale, true, 'stale');
+    eq(snap.reason, 'session-expired', `reason（error=${snap.error}）`);
+    assert(/SERVICETOKEN_EXPIRED/.test(String(snap.error)), `error 没带出服务端消息：${snap.error}`);
+    eq(snap.points.length, 7, '本地曲线');
+    return `426 → reason=session-expired，error="${snap.error}"，points=${snap.points.length}（卡片才会说「请重新登录」）`;
+  });
+
+  await check('5.14', 'HTTP 426 但不是会话问题 → 仍判 cloud（别把 426 一律当过期）', async () => {
+    const copy = prepareCopyDb('other-426.db');
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      status: 426, ok: false, text: async () => '<html>upgrade your client</html>',
+    });
+    let snap;
+    try {
+      snap = await readWeight({ ...realConfig, weightDb: copy }, { force: true });
+    } finally { globalThis.fetch = realFetch; }
+    eq(snap.reason, 'cloud', `reason（error=${snap.error}）`);
+    eq(snap.points.length, 7, '本地曲线');
+    return `426 + 非 JSON body → 仍 reason=cloud，error="${snap.error}"（不误导用户去重登）`;
+  });
+
+  await check('5.15', 'HTTP 401 → reason=session-expired（原有判据不回退）', async () => {
+    const copy = prepareCopyDb('expired-401.db');
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      status: 401, ok: false, text: async () => '{"code":2,"message":"auth error"}',
+    });
+    let snap;
+    try {
+      snap = await readWeight({ ...realConfig, weightDb: copy }, { force: true });
+    } finally { globalThis.fetch = realFetch; }
+    eq(snap.reason, 'session-expired', `reason（error=${snap.error}）`);
+    return `401 → reason=session-expired，error="${snap.error}"`;
+  });
+
+  await check('5.16', 'HTTP 200 但 payload 明说 SERVICETOKEN_EXPIRED 且 0 条 → 判会话过期，不当「云回 0 条」', async () => {
+    const copy = prepareCopyDb('expired-200.db');
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      status: 200, ok: true, text: async () => JSON.stringify({ code: 0, message: 'SERVICETOKEN_EXPIRED', result: [] }),
+    });
+    let snap;
+    try {
+      snap = await readWeight({ ...realConfig, weightDb: copy }, { force: true });
+    } finally { globalThis.fetch = realFetch; }
+    eq(snap.reason, 'session-expired', `reason（error=${snap.error}）`);
+    eq(snap.points.length, 7, '本地曲线');
+    return `200 + SERVICETOKEN_EXPIRED + 空 result → reason=session-expired（不再是「云返回 0 条」）`;
   });
 
   // ════════════════ 6. TTL / force ════════════════

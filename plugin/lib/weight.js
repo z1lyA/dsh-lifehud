@@ -169,6 +169,39 @@ function readMiSession(path) {
 }
 
 /**
+ * 会话失效的判定。
+ *
+ * 小米云用**两套信号**，只看 HTTP 状态码会误判（2026-11-14 实测踩到）：
+ *   - `401` / `403`：网关不认这个请求（token 被改坏时实测 `401` + `{"code":2,"message":"auth error"}`）；
+ *   - `426` + `{"code":0,"message":"SERVICETOKEN_EXPIRED"}`：认得出 token，但判定它已过期。
+ *     426 在 HTTP 标准里是 Upgrade Required，小米拿它当「令牌该换了」的暗号，真相在响应体的文本里。
+ *
+ * 判错的代价不是崩溃，而是**卡片说错话**：显示「小米云返回异常」而不是「请重新登录」，
+ * 用户就不知道该自己去重登，只会以为云端抽风。
+ * @param {number} status HTTP 状态码 @param {string} body 响应体
+ * @returns {'session-expired'|'cloud'} reason
+ */
+function miFailureReason(status, body) {
+  if (status === 401 || status === 403) return 'session-expired';
+  if (/SERVICETOKEN_EXPIRED|SESSION_EXPIRED|TOKEN_EXPIRED/i.test(String(body ?? ''))) return 'session-expired';
+  return 'cloud';
+}
+
+/**
+ * 从错误响应体里取小米的服务端消息（不是 JSON 就给空串）。
+ * 带进 error 是为了让诊断和日志一眼看出「426 到底在说什么」，别再只报一个裸状态码。
+ * @param {string} text 响应体 @returns {string} message
+ */
+function miBodyMessage(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return typeof parsed?.message === 'string' ? parsed.message : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * `POST /app/user/get_user_device_data`。响应可能是明文 JSON，也可能是 RC4 密文。
  * @param {object} session @param {object} data request body
  * @param {string} [path] 小米云路径，默认取称重记录端点
@@ -214,17 +247,22 @@ async function miDeviceData(session, data, path = MI_DEVICE_DATA_PATH) {
     throw new MiCloudError('network', `小米云连接失败：${error instanceof Error ? error.message : String(error)}`);
   }
 
-  if (response.status === 401 || response.status === 403) {
-    throw new MiCloudError('session-expired', `小米云 HTTP ${response.status}`);
-  }
-  if (!response.ok) throw new MiCloudError('cloud', `小米云 HTTP ${response.status}`);
-
+  // 先把 body 读出来再判状态：426 的真相（SERVICETOKEN_EXPIRED）只在 body 里。
   let text;
   try {
     text = (await response.text()).trim();
   } catch (error) {
     throw new MiCloudError('network', `小米云响应读取失败：${error instanceof Error ? error.message : String(error)}`);
   }
+
+  if (!response.ok) {
+    const detail = miBodyMessage(text);
+    throw new MiCloudError(
+      miFailureReason(response.status, text),
+      `小米云 HTTP ${response.status}${detail ? ` ${detail}` : ''}`,
+    );
+  }
+
   try {
     if (text.startsWith('{') || text.startsWith('[')) return JSON.parse(text);
     return JSON.parse(miDecrypt(signedNonce, text).toString('utf8'));
@@ -333,6 +371,11 @@ async function pullWeight(config) {
   }
 
   const rows = Array.isArray(payload.result) ? payload.result : [];
+  // 兜底：万一网关改成用 200 + `SERVICETOKEN_EXPIRED` 回话（2026-11-14 是 426），
+  // 也不能当成「云回了 0 条」静默降级 —— 那不是数据问题，是会话问题，得让用户去重登。
+  if (rows.length === 0 && /SERVICETOKEN_EXPIRED|SESSION_EXPIRED/i.test(String(payload?.message ?? ''))) {
+    throw new MiCloudError('session-expired', `小米云 ${payload.message}`);
+  }
   return rows.map(toWeightRow).filter(Boolean);
 }
 
