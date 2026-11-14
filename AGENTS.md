@@ -12,7 +12,8 @@
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
 | 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 46 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 48 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
+| 小米云会话过期了 | `node notes/tools/mi-login.mjs`：扫码/链接确认重登，自动写回 `mi-session.json`（**本地脚本，未随仓库发布**）。备份依赖：`mi-login-qr.png`。细节见 `docs/小米云取数.md` §4 |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
 | 认识专注卡那条链路 | 本文件 §7「专注卡怎么工作」+ `plugin/collector.ps1`，代码入口 `startCollector()` / `readOwnActivity()` |
@@ -108,6 +109,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **`window.open`** 在 DSH 里能打开外部网页（网页对话卡就是这么做的），但不能 iframe 站外页面（会被 X-Frame-Options 拒绝）。
 - **会话点击跳转**走 `ctx.get('uiWorkspace')?.openSession(id)`（原生侧栏就是这么调的）。若拿不到会 `console.warn`，需要在浏览器控制台确认。
 - **小米云的会话过期不只用 401 表达**（2026-11-14 实测）：token 失效时它回 **HTTP 426 + `{"code":0,"message":"SERVICETOKEN_EXPIRED"}`**。426 在标准里是 *Upgrade Required*，小米拿它当「令牌该换了」的暗号，**真相只在 body 里**。所以 `miDeviceData()` 必须先读 body 再判状态，`miFailureReason()` 同时看状态码和 body 文本；只看 401/403 会把过期报成 `cloud`，卡片就说「小米云返回异常」而不是「请重新登录」，用户没法自救。回归用例：`probe-weight.mjs` 5.13–5.16。同类坑：`spike/probe-weight.mjs` 5.7 原来打真云测「业务错误」，会话一过期就跟着红 —— 凡是判 `reason` 的用例一律用 stub fetch，别把会话状态混进断言。
+- **设备指纹必须稳定，别每次请求现生成**（2026-11-15 修）：`miDeviceData()` 曾经在**每个请求**里现摇一个 6 位随机 `deviceId`（UA 尾巴也随机）。配合 Host 每 10 分钟 `force` 同步，等于同一账号同一 IP 一天冒出 144 台「新手机」——这正是盗号风控的特征，是令牌只活 7 天（2026-11-06→11-13）的主要嫌疑。现在 `miDeviceIdOf(config)` **首次生成一次 → 写进体重库 `meta.miDeviceId` → 一直复用**（DSH 重启也不变），UA 尾巴进程内固定。参考实现 Xiaomi-cloud-tokens-extractor 也是 `__init__` 里生成一次。回归用例：`probe-weight.mjs` 5.17/5.18。**别再退回「每次随机」**。
 - **Node 24 没有 RC4**。`createCipheriv('rc4', …)` 抛 `digital envelope routines::unsupported`（OpenSSL 3 不带 legacy provider），所以小米云那段是**纯 JS RC4**，且必须**先吃掉 1024 字节密钥流**才和 `micloud` 对得上。
 - **小米云的响应可能是密文**。不以 `{`/`[` 开头时要用同一个 `signed_nonce` 解密，别直接 `JSON.parse`。
 - **`weightId` 是毫秒时间戳但必须当文本**：JSON.parse 会把它变成 number（`1786238280146`），一旦写进库成 `1786238280146.0` 就再也去不了重。
@@ -192,7 +194,7 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
   4. 底部日期标签行：字号同样 `12.5px`、颜色 `rgba(128,128,128,0.85)`，与点中心对齐（日期行要让出纵轴 gutter 的 34px）；
   5. 颜色只用 `currentColor` / `rgba(128,128,128,α)`，深/浅主题都要能读。
 - **改它的入口**：`client.js` 的 `useWeight` / `WeightChart` / `WeightBody`；Host 侧 `plugin/lib/weight.js` 的 `readWeight` / `pullWeight` / `miFailureReason`。
-- **验证**：`node spike/probe-weight.mjs`（46 项，含幂等/缺失日/stale/TTL/失败分类/路由契约）。
+- **验证**：`node spike/probe-weight.mjs`（48 项，含幂等/缺失日/stale/TTL/失败分类/设备指纹/路由契约）。
 
 ### 内嵌网页是怎么做到的（重要）
 
