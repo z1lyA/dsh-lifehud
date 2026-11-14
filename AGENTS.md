@@ -1,7 +1,7 @@
 # AGENTS.md — dsh-lifehud 协作手册
 
 > 给接手的 AI：读这一份就能继续开发。**只写长期稳定的事实**，版本细节写 `spike/RESULT.md`。
-> 最后更新：2026-11-12 ｜ 插件版本：1.1.2
+> 最后更新：2026-11-15 ｜ 插件版本：1.1.3
 
 ---
 
@@ -103,6 +103,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 ## 6. 坑（踩过的）
 
 - **Host 代码没有热更新**。改完必须 remove + install，否则你以为改了其实没生效。
+- **但 remove → install 也不保证重新 import `plugin/lib/*.js`**（2026-11-15 实测）：Cordis 确实重新 apply 了入口，Node 的 ESM 缓存却按 URL 命中，**已经求值过的 `lib/*.js` 不会再跑一遍**。症状：`install_bundle` 返回 `changed:true`、`version` 也是新的，但 `/hud` 的 `version` 还是旧值、新加副作用不出现（当时删掉 `meta.miDeviceId` 再 `?force=1`，新代码会立刻重写它，结果没写 → 证明跑的仍是旧 `weight.js`）。**判别法**：找一个「只有新代码才会做」的副作用去验，或直接看 `/hud` 的 `version`；别拿 install 的返回值当生效证据。**真要让 Host 改动生效：重启 DSH**（重启后本会话可恢复）。
 - **插件路由不设防**（见约定 2）。
 - **NowTree 的 `time_slot` 语义**：库里 58 条 active，但符合 NowTree 自身"Next"语义的只有 2 条。本插件的口径是**用户视角**——只要 `time_slot` 命中当前时段就显示，另用 `NEXT` 徽标标出哪些在 NowTree 的 Next 里。
 - **AW 事件量**：一天 500+ 条正常，`limit=20000` 足够；不要按秒刷。
@@ -140,6 +141,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - ✅ 开机预热：Host `apply()` 里先跑一次 `buildHud` + `readWeight`；Client 加载时 `fetchHud()` / `fetchWeight()` 预取。
 - ✅ HUD 自动刷新（v1.1.1）：Client `useHud()` 每 5 分钟静默重取一次（页面隐藏时不发请求，`visibilitychange` 回页面补一次；三道护栏防并发：hidden / `prefetch` 在飞 / `HUD_TTL` 未过期都跳过）。
 - ✅ 体重同步：Host 每 10 分钟自动拉一次小米云（定时器可 dispose）；页面「刷新」按钮带 `?force=1` 立即拉，**这是"刚踩秤就能看到"的主路径**。
+- ✅ 体重健壮性（v1.1.3）：会话过期不再被误报成「云端异常」（426/SERVICETOKEN_EXPIRED → `session-expired`，卡片提示「请重新登录」）；设备指纹改成持久固定（见 §6），避免被小米风控当成盗号而提前掐会话。
 - ✅ 检查更新（v1.1.2）：页面「设置 → 版本与更新」手动点才联网（**不做启动自动检查**）；Host 读 GitHub Release/Tag，取最大语义版本，有 Release 就显示发布日期与正文；`/hud` 新增 `version` 字段（Host 版本），页面拿它和 `BUILD` 对比提示「页面资源旧了」；上次结果存 localStorage（键 `lifehud.update.v1`，版本变了自动作废，只回显不发请求）。
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
 - ⚠️ 天气的"一句话"是规则拼的，不是模型生成。
