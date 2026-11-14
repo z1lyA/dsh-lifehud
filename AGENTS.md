@@ -85,7 +85,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 | DSH 会话 | `$DSH_HOME/storages/session_projcache/sessions/session-<uuid>.json` | 读 json，`rows.title.val` + `rows.sessionListMetadata.val.lastPromptAt` | **sessionId 就是文件名里的 uuid**（去掉 `session-` 前缀）。不要解压 `session.v4.jsonl.zstd` |
 | 专注 / 热力 | **自采集**：`plugin/collector.ps1` → `<dataDir>/capture.db` | Host spawn 长驻 PowerShell 子进程，stdout 每 2 秒一行 JSON；Host 合并成带 `duration` 的事件写库（窗口 / AFK / 空闲强度三条流）；页面只读库 | 零安装（PowerShell 5.1 + C# P/Invoke）；`storeTitles:false` 只存应用名；**AFK 区间必须从窗口事件里扣掉**，否则 explorer.exe 会占几百分钟；采集器只能由 Host 启停（见 §6 孤儿进程）；`idle_seconds` 只存**离散档位**（`0-10/10-60/60-180/180+`），别存原始秒数 |
 | ActivityWatch（历史） | `%LOCALAPPDATA%\activitywatch\activitywatch\aw-server\peewee-sqlite.v2.db` | 只在 **首次迁移** 时读一次文件（先复制含 -wal/-shm 的副本到 tmpdir 再只读打开），把全部 bucket + `events.data` 原始 JSON + `settings.json` 的 `classes` 搬进 `capture.db` | **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**——用 id 文本查会静默返回 0 行；迁移幂等（`meta.history_imported`）；运行期**零 AW 依赖** |
-| 体重 | 小米云 `https://api.io.mi.com/app/user/get_user_device_data` | POST，`type=weight` / `key=bodyInfo` / `group=raw`，**时间单位是秒**；RC4 签名 + 会话文件 | 会话默认读 `<dataDir>/mi-session.json`（**不进 git**）；设备号**自动发现**（`/home/device_list` 里 model 带 `scales` 的那台），不写死；`weightId` 必须按 TEXT 存；Host 每 10 分钟自动同步，`?force=1` 跳过 TTL。细节见 `docs/小米云取数.md` |
+| 体重 | 小米云 `https://api.io.mi.com/app/user/get_user_device_data` | POST，`type=weight` / `key=bodyInfo` / `group=raw`，**时间单位是秒**；RC4 签名 + 会话文件 | 会话默认读 `<dataDir>/mi-session.json`（**不进 git**）；设备号**自动发现**（`/home/device_list` 里 model 带 `scales` 的那台），不写死；`weightId` 必须按 TEXT 存；Host 每 10 分钟自动同步，`?force=1` 跳过 TTL；**会话过期长什么样见 §6 与 `docs/小米云取数.md` §4**（不止 401，还有 426） |
 | 检查更新（v1.1.2） | GitHub REST：`/repos/<owner>/<repo>/releases/latest`，404 时回退 `/tags?per_page=30` | 只在页面手动点「检查更新」时请求；`user-agent: dsh-lifehud/<版本>`，不带任何凭据 | 取 tags 里**最大**的语义版本，不取第一个；**没有 TTL 缓存**（手动点就该真打一次），只保留最近一次成功结果用于失败降级；并发连点由单飞合并；失败返回 `stale` 快照，从不抛给页面 |
 
 ## 5. 约定（照做）
@@ -107,6 +107,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **AW 事件量**：一天 500+ 条正常，`limit=20000` 足够；不要按秒刷。
 - **`window.open`** 在 DSH 里能打开外部网页（网页对话卡就是这么做的），但不能 iframe 站外页面（会被 X-Frame-Options 拒绝）。
 - **会话点击跳转**走 `ctx.get('uiWorkspace')?.openSession(id)`（原生侧栏就是这么调的）。若拿不到会 `console.warn`，需要在浏览器控制台确认。
+- **小米云的会话过期不只用 401 表达**（2026-11-14 实测）：token 失效时它回 **HTTP 426 + `{"code":0,"message":"SERVICETOKEN_EXPIRED"}`**。426 在标准里是 *Upgrade Required*，小米拿它当「令牌该换了」的暗号，**真相只在 body 里**。所以 `miDeviceData()` 必须先读 body 再判状态，`miFailureReason()` 同时看状态码和 body 文本；只看 401/403 会把过期报成 `cloud`，卡片就说「小米云返回异常」而不是「请重新登录」，用户没法自救。回归用例：`probe-weight.mjs` 5.13–5.16。同类坑：`spike/probe-weight.mjs` 5.7 原来打真云测「业务错误」，会话一过期就跟着红 —— 凡是判 `reason` 的用例一律用 stub fetch，别把会话状态混进断言。
 - **Node 24 没有 RC4**。`createCipheriv('rc4', …)` 抛 `digital envelope routines::unsupported`（OpenSSL 3 不带 legacy provider），所以小米云那段是**纯 JS RC4**，且必须**先吃掉 1024 字节密钥流**才和 `micloud` 对得上。
 - **小米云的响应可能是密文**。不以 `{`/`[` 开头时要用同一个 `signed_nonce` 解密，别直接 `JSON.parse`。
 - **`weightId` 是毫秒时间戳但必须当文本**：JSON.parse 会把它变成 number（`1786238280146`），一旦写进库成 `1786238280146.0` 就再也去不了重。
@@ -190,8 +191,8 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
   3. **点值默认隐藏，鼠标悬停才显示**（2026-11-09 按用户反馈调整）：鼠标移到某一天所在的整列（SVG 里每列一个 `rect`，`fill:none` + `pointer-events:all`）→ 该点放大 + 竖向虚线 + **只显示数值**的标签（`12.5px / 600`；最多 2 位小数去尾零，如 `66.5` / `66.02`；**不要带日期**，日期横轴上已经有）。顶部大数字同一精度口径；
   4. 底部日期标签行：字号同样 `12.5px`、颜色 `rgba(128,128,128,0.85)`，与点中心对齐（日期行要让出纵轴 gutter 的 34px）；
   5. 颜色只用 `currentColor` / `rgba(128,128,128,α)`，深/浅主题都要能读。
-- **改它的入口**：`client.js` 的 `useWeight` / `WeightChart` / `WeightBody`；Host 侧 `readWeight`（`plugin/index.js`）。
-- **验证**：`node spike/probe-weight.mjs`（46 项，含幂等/缺失日/stale/TTL/路由契约）。
+- **改它的入口**：`client.js` 的 `useWeight` / `WeightChart` / `WeightBody`；Host 侧 `plugin/lib/weight.js` 的 `readWeight` / `pullWeight` / `miFailureReason`。
+- **验证**：`node spike/probe-weight.mjs`（46 项，含幂等/缺失日/stale/TTL/失败分类/路由契约）。
 
 ### 内嵌网页是怎么做到的（重要）
 
