@@ -352,7 +352,7 @@ function applyInner(ctx, config) {
 export { readOwnActivity } from './lib/activity.js';
 export { openCaptureDb, appendSample, flushCapture, captureStatus, startCollector, importHistory } from './lib/capture.js';
 export { readWeight } from './lib/weight.js';
-export { buildHud } from './lib/hud.js';
+export { buildHud, readWeather, clearWeatherCache, weatherStatus } from './lib/hud.js';
 export {
   parseVersion, compareVersion, summarizeUpdate, readUpdate, UPDATE_REASON_CODES,
 } from './lib/update.js';

@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
-import { buildHud, openCaptureDb, readOwnActivity } from '../plugin/index.js';
+import { buildHud, openCaptureDb, readOwnActivity, readWeather, clearWeatherCache, weatherStatus } from '../plugin/index.js';
 import { NOWTREE_DB, NOWTREE_LEVELDB } from './paths.mjs';
 
 const results = [];
@@ -296,6 +296,94 @@ try {
     const gaps = eventDays.filter((key) => heat.has(key) && key !== today && (heat.get(key) ?? 0) <= 0);
     check('真实库：有窗口数据的每一天热力都不为 0（不断档，今天除外）', gaps.length === 0,
       `${eventDays.length} 天有窗口数据，其中热力为 0 的 ${gaps.length} 天：${gaps.slice(0, 3).join(',')}`);
+  }
+
+  /* ------------------------------------------- 天气：超时 + 失败冷却（v1.1.3） */
+  // 真机上踩到的：天气不可达时 `/hud` 每次都要 6.02s（= 当时的超时上限），整页跟着慢。
+  // 这一段全用 stub fetch，不碰真网络。
+  {
+    const realFetch = globalThis.fetch;
+    const realNow = Date.now;
+    const LAT = 39.9;
+    const LON = 116.4;
+
+    /** 一份最小的 open-meteo 成功响应。 */
+    const okPayload = () => ({
+      hourly: {
+        time: ['2026-11-15T09:00', '2026-11-15T10:00'],
+        temperature_2m: [20.1, 21.2],
+        precipitation_probability: [0, 5],
+        weather_code: [0, 0],
+        is_day: [1, 1],
+      },
+      daily: { sunrise: ['2026-11-15T06:59'], sunset: ['2026-11-15T16:57'] },
+    });
+    const okResponse = () => ({ ok: true, status: 200, json: async () => okPayload() });
+    const run = async () => { try { return await readWeather(LAT, LON); } catch { return undefined; } };
+
+    try {
+      // 1) 超时与冷却的数值（曾经的 6s 就是慢的根源）
+      const st0 = weatherStatus();
+      check('天气超时 = 3s（不是 6s）', st0.timeoutMs === 3000, String(st0.timeoutMs));
+      check('天气失败冷却 = 2 分钟', st0.cooldownMs === 120000, String(st0.cooldownMs));
+
+      // 2) 失败一次：抛错 + 只打一次网络 + 记进失败状态
+      clearWeatherCache();
+      let calls = 0;
+      globalThis.fetch = async () => { calls += 1; throw new TypeError('stub: 天气不可达'); };
+      const first = await run();
+      check('天气失败会抛错（交给 buildHud 回落缓存）', first === undefined, String(first));
+      check('失败时确实发了一次请求', calls === 1, `calls=${calls}`);
+      check('失败被记进冷却状态', weatherStatus().failed !== null);
+
+      // 3) 冷却期内：一次网络都不打，立刻返回
+      const t0 = realNow();
+      const v = await run();
+      const ms = realNow() - t0;
+      check('冷却期内不再打网络', calls === 1, `calls=${calls}`);
+      check('冷却期内立即返回（不再阻塞首屏）', ms < 100, `${ms}ms`);
+      check('无缓存时返回 null（卡片显示「取不到」）', v === null, String(v));
+
+      // 4) 冷却到期后会重新尝试
+      Date.now = () => realNow() + 120001;
+      await run();
+      Date.now = realNow;
+      check('冷却到期后会重新尝试', calls === 2, `calls=${calls}`);
+
+      // 5) 有旧缓存时，冷却期内给旧值而不是 null
+      clearWeatherCache();
+      calls = 0;
+      globalThis.fetch = async () => { calls += 1; return okResponse(); };
+      const good = await run();
+      check('成功一次即有值', good && good.hourly?.length === 2, JSON.stringify(good?.hourly?.length));
+      Date.now = () => realNow() + 11 * 60 * 1000; // TTL(10min) 已过
+      globalThis.fetch = async () => { calls += 1; throw new TypeError('stub: 又断了'); };
+      await run(); // 这次失败，进冷却
+      const stale = await run();
+      Date.now = realNow;
+      check('冷却期内返回上一次的好值（不是 null）', stale && stale.hourly?.length === 2,
+        JSON.stringify(stale?.hourly?.length ?? stale));
+
+      // 6) clearWeatherCache 会同时清掉失败状态（换位置后要能立刻重试）
+      clearWeatherCache();
+      check('clearWeatherCache 同时清掉失败状态', weatherStatus().failed === null);
+
+      // 7) 并发单飞：两个并发只打一次网络
+      clearWeatherCache();
+      calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        await new Promise((r) => setTimeout(r, 30));
+        return okResponse();
+      };
+      const [a, b] = await Promise.all([run(), run()]);
+      check('并发两次只打一次网络（单飞）', calls === 1, `calls=${calls}`);
+      check('两个并发拿到同一份结果', a?.hourly?.length === 2 && b?.hourly?.length === 2);
+    } finally {
+      globalThis.fetch = realFetch;
+      Date.now = realNow;
+      clearWeatherCache();
+    }
   }
 } finally {
   rmSync(workDir, { recursive: true, force: true });

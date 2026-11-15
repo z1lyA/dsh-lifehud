@@ -14,7 +14,19 @@ import { envPath } from './util.js';
 
 const DEFAULT_BOUNDS = { morningStart: 6, noonStart: 13, eveningStart: 18 };
 const SLOT_LABEL = { morning: '早', noon: '午', evening: '晚', rest: '休息' };
+/** 成功取到一次就复用这么久，避免开页面就打一次天气 API。 */
 const WEATHER_TTL_MS = 10 * 60 * 1000;
+/**
+ * 单次取天气的超时。健康时实测 1–2.3 秒就回来，3 秒够了。
+ * 别调大：`/hud` 是整页首屏的入口，天气卡等多久，其它卡就跟着等多久
+ * （2026-11-15 实测：天气不可达时 6 秒超时 → 每次 `/hud` 都要 6.02s）。
+ */
+const WEATHER_TIMEOUT_MS = 3000;
+/**
+ * 失败后的冷却窗口：这段时间里 `/hud` **不再**去试探天气，直接给上次的值（或空）。
+ * 没有它的话，天气一路不通 = 每次刷新都白等一个完整超时，页面会「一直很慢」。
+ */
+const WEATHER_FAIL_COOLDOWN_MS = 2 * 60 * 1000;
 
 /** NowTree 的 SQLite（`%APPDATA%\com.nowtree.app\nowtree.sqlite`）。 */
 const defaultNowtreeDb = () => envPath(process.env.APPDATA ?? '', 'com.nowtree.app', 'nowtree.sqlite');
@@ -137,7 +149,7 @@ async function fetchWeather(lat, lon) {
     + `?latitude=${lat}&longitude=${lon}`
     + '&hourly=temperature_2m,precipitation_probability,weather_code,is_day'
     + '&daily=sunrise,sunset&forecast_days=2&timezone=Asia%2FShanghai';
-  const response = await fetch(url, { signal: AbortSignal.timeout(6000) });
+  const response = await fetch(url, { signal: AbortSignal.timeout(WEATHER_TIMEOUT_MS) });
   if (!response.ok) throw new Error(`open-meteo HTTP ${response.status}`);
   const data = await response.json();
   const times = data.hourly?.time ?? [];
@@ -190,20 +202,66 @@ async function fetchWeather(lat, lon) {
 
 /** @type {{key:string,at:number,value:object}|null} */
 let weatherCache = null;
+/** @type {{key:string,at:number,message:string}|null} 上一次失败（冷却窗口从这里算起） */
+let weatherFail = null;
+/** @type {{key:string,promise:Promise<object>}|null} 单飞：并发请求共用同一次尝试 */
+let weatherInflight = null;
+
+/** 上一次成功取到的值（哪怕已过期）—— 失败时用它兜底，别再让页面空着。 */
+const staleWeather = (key) => (weatherCache && weatherCache.key === key ? weatherCache.value : null);
 
 /**
  * Cached weather so re-opening the page never waits on the network.
+ *
+ * 两层保护（2026-11-15 加）：天气服务不可达时，`/hud` 是整页首屏，
+ * 不能让每个请求都等满一个超时（当时实测 6.02s/次，页面「一直很慢」）：
+ *   1. 失败后进入 `WEATHER_FAIL_COOLDOWN_MS` 冷却 —— 期间直接返回上次的值/空，不再打网络；
+ *   2. 并发请求单飞 —— N 个请求共用一次尝试，不会叠加成 N×超时。
  * @param {number} lat @param {number} lon
- * @returns {Promise<object>} weather
+ * @returns {Promise<object|null>} weather
  */
-async function readWeather(lat, lon) {
+export async function readWeather(lat, lon) {
   const key = `${lat},${lon}`;
   if (weatherCache && weatherCache.key === key && Date.now() - weatherCache.at < WEATHER_TTL_MS) {
     return weatherCache.value;
   }
-  const value = await fetchWeather(lat, lon);
-  weatherCache = { key, at: Date.now(), value };
-  return value;
+  if (weatherFail && weatherFail.key === key && Date.now() - weatherFail.at < WEATHER_FAIL_COOLDOWN_MS) {
+    return staleWeather(key);
+  }
+  if (weatherInflight && weatherInflight.key === key) return weatherInflight.promise;
+
+  const attempt = (async () => {
+    try {
+      const value = await fetchWeather(lat, lon);
+      weatherCache = { key, at: Date.now(), value };
+      weatherFail = null;
+      return value;
+    } catch (error) {
+      weatherFail = {
+        key,
+        at: Date.now(),
+        message: error instanceof Error ? error.message : String(error),
+      };
+      throw error;
+    }
+  })();
+
+  const entry = { key, promise: attempt };
+  weatherInflight = entry;
+  // 只清理自己这一轮：别把后来者的单飞记录抹掉，也别让这条链产生未处理的 rejection。
+  attempt.then(() => {}, () => {}).then(() => { if (weatherInflight === entry) weatherInflight = null; });
+  return attempt;
+}
+
+/** 诊断/测试用：看一眼当前天气状态（不触发网络）。 */
+export function weatherStatus() {
+  return {
+    cached: weatherCache ? { key: weatherCache.key, at: weatherCache.at } : null,
+    failed: weatherFail ? { key: weatherFail.key, at: weatherFail.at, message: weatherFail.message } : null,
+    inflight: Boolean(weatherInflight),
+    cooldownMs: WEATHER_FAIL_COOLDOWN_MS,
+    timeoutMs: WEATHER_TIMEOUT_MS,
+  };
 }
 
 /**
@@ -348,8 +406,13 @@ export async function buildHud(config = {}, runtime = {}) {
     // 采集器自己的状态（是否在跑 / 收到多少样本 / 最后一次错误），
     // 给页面诊断区用。只加字段，不改既有契约。
     capture: captureStatus(),
+    // 天气这层自己的状态（是否有缓存 / 上次失败时间 / 超时与冷却的生效值）。
+    // 存在的意义：`remove → install` 不保证重新求值 lib/*.js（见 AGENTS §6），
+    // 而 `version` 从 package.json 读、不吃这个亏；于是「进程里跑的是哪一版 hud.js」
+    // 只能靠这种新字段来判：字段在 = 新代码；字段没出来 = 还是旧的。
+    weatherDiag: weatherStatus(),
     warnings,
   };
 }
 /** 位置变了 / 设置更新后让天气下次重新拉。 */
-export function clearWeatherCache() { weatherCache = null; }
+export function clearWeatherCache() { weatherCache = null; weatherFail = null; }
