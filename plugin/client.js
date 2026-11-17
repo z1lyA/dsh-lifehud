@@ -1263,6 +1263,17 @@ if (!window.__lifehudClientRegistered) {
           const openChat = () => window.open(settings.chatUrl || 'https://chat.deepseek.com/', '_blank', 'noopener');
 
           /* ---- 卡片 ---- */
+          // 天气卡底部一行状态：断线时明确告诉用户「这是几点的数据」或「现在取不到」。
+          // 数据来自 /hud 的 weatherDiag（Host 旧了就没有这个字段，整行不显示）。
+          const weatherDiag = data?.weatherDiag ?? null;
+          const weatherNote = !weatherDiag ? '' : (() => {
+            const at = weatherDiag.cached?.at;
+            if (weather && weatherDiag.failed && at) return `取不到最新的 · 显示的是 ${relTime(at)}的数据`;
+            if (!weather && at) return `现在取不到 · 显示 ${relTime(at)}之前的数据`;
+            if (!weather) return weatherDiag.failed?.at ? `现在取不到 · ${relTime(weatherDiag.failed.at)}试过一次` : '正在获取…';
+            return '';
+          })();
+
           const weatherCard = h(Card, {
             key: 'weather',
             wide: true,
@@ -1272,23 +1283,31 @@ if (!window.__lifehudClientRegistered) {
             },
             title: '天气',
             titleStyle: { color: '#9ec6ee' },
-          }, weather
-            ? h('div', { key: 'wb', style: { display: 'flex', alignItems: 'center', gap: 28, flexWrap: 'wrap', justifyContent: 'center', height: '100%' } }, [
-              // 左：大温度 + 一句话；右：连续 8 小时（英雄卡是通栏，横向给足）
-              h('div', { key: 'left', style: { flex: '0 0 auto' } }, [
-                h('div', { key: 'row', style: { display: 'flex', alignItems: 'baseline', gap: 10 } }, [
-                  h(WeatherIcon, { key: 'i', kind: weather.nowIcon ?? 'cloud', size: 26 }),
-                  h('div', { key: 'n', style: { fontSize: 46, fontWeight: 600, letterSpacing: '-0.04em', lineHeight: 1 } }, `${Math.round(weather.now)}`),
-                  h('div', { key: 'u', style: { fontSize: 16, color: '#c9def5' } }, `℃ ${weather.nowText ?? ''}`),
+          }, h('div', { key: 'wcol', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } }, [
+            weather
+              ? h('div', { key: 'wb', style: { display: 'flex', alignItems: 'center', gap: 28, flexWrap: 'wrap', justifyContent: 'center', height: '100%' } }, [
+                // 左：大温度 + 一句话；右：连续 8 小时（英雄卡是通栏，横向给足）
+                h('div', { key: 'left', style: { flex: '0 0 auto' } }, [
+                  h('div', { key: 'row', style: { display: 'flex', alignItems: 'baseline', gap: 10 } }, [
+                    h(WeatherIcon, { key: 'i', kind: weather.nowIcon ?? 'cloud', size: 26 }),
+                    h('div', { key: 'n', style: { fontSize: 46, fontWeight: 600, letterSpacing: '-0.04em', lineHeight: 1 } }, `${Math.round(weather.now)}`),
+                    h('div', { key: 'u', style: { fontSize: 16, color: '#c9def5' } }, `℃ ${weather.nowText ?? ''}`),
+                  ]),
+                  h('div', { key: 's', style: { fontSize: 13, color: '#c9def5', marginTop: 6 } }, weather.summary),
                 ]),
-                h('div', { key: 's', style: { fontSize: 13, color: '#c9def5', marginTop: 6 } }, weather.summary),
-              ]),
-              h('div', { key: 'right', style: { flex: '1 1 380px', minWidth: 0 } },
-                h(HourlyStrip, {
-                  key: 'hs', hourly: weather.hourly, nowIndex: weather.nowIndex, count: settings.weatherHours,
-                })),
-            ])
-            : h('div', { key: 'e', style: { ...S.empty, color: '#c9def5' } }, '天气取不到'));
+                h('div', { key: 'right', style: { flex: '1 1 380px', minWidth: 0 } },
+                  h(HourlyStrip, {
+                    key: 'hs', hourly: weather.hourly, nowIndex: weather.nowIndex, count: settings.weatherHours,
+                  })),
+              ])
+              : h('div', { key: 'e', style: { ...S.empty, color: '#c9def5' } }, '天气取不到'),
+            weatherNote
+              ? h('div', {
+                key: 'wn',
+                style: { fontSize: 11.5, color: '#9ec6ee', marginTop: 6, textAlign: 'right' },
+              }, weatherNote)
+              : null,
+          ]));
 
           const tasksCard = h(Card, { key: 'tasks', title: '当前时段任务' },
             tasks.items.length === 0
