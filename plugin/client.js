@@ -24,7 +24,7 @@ if (!window.__lifehudClientRegistered) {
       const PANEL_ID = 'lifehud';
       const NS = 'lifehud';
       /** 客户端构建标记：改这里 → 页面上能一眼看出加载的是哪一版。 */
-      const BUILD = '1.1.4';
+      const BUILD = '1.1.5';
       const HUD_URL = '/lifehud/api/hud';
       const WEIGHT_URL = '/lifehud/api/weight';
       const PHOTO_URL = '/lifehud/api/photo';
@@ -983,6 +983,12 @@ if (!window.__lifehudClientRegistered) {
           border: 'none', borderRadius: 10,
         };
         const clock = props.clock ?? {};
+        // 天气一句话状态：只保留「正常 / 用缓存 / 取不到」三态 + 时间，不做花哨展示。
+        // 目的：天气断线时你能自己看出「是刚刚抖了一下，还是已经断了几小时」，不用来问人。
+        const wd = props.weatherDiag;
+        const weatherLine = !wd ? '' : wd.cached
+          ? `天气：${wd.failed ? '这次没取到，用的是上次的数据' : '正常'} · ${relTime(wd.cached.at)}更新`
+          : `天气：取不到${wd.failed ? ` · ${relTime(wd.failed.at)}失败过` : '（还没成功过）'}`;
         const pill = (active) => ({
           fontSize: 12.5, padding: '6px 14px', borderRadius: 980, border: 'none', cursor: 'pointer',
           background: active ? T.text : '#2c2c2e', color: active ? '#000' : T.text2,
@@ -1133,6 +1139,7 @@ if (!window.__lifehudClientRegistered) {
                 + `${clock.bounds?.morningStart ?? '-'}/${clock.bounds?.noonStart ?? '-'}/${clock.bounds?.eveningStart ?? '-'}`
                 + ` · 当前 ${clock.label ?? '-'} ${clock.range ?? ''}`),
               h('div', { key: 'w', style: S.dim }, props.warnings?.length ? `⚠ ${props.warnings.join(' / ')}` : '数据源正常'),
+              weatherLine ? h('div', { key: 'wx', style: S.dim }, weatherLine) : null,
             ]),
           ]),
         ]);
@@ -1408,6 +1415,7 @@ if (!window.__lifehudClientRegistered) {
               key: 'dlg', settings, onChange: onChangeSettings,
               onClose: () => setShowSettings(false),
               clock, warnings: data?.warnings ?? [],
+              weatherDiag: data?.weatherDiag ?? null,
               locationLat: data?.location?.latitude ?? null,
               locationLon: data?.location?.longitude ?? null,
               onLocate, locateError,
