@@ -3,9 +3,9 @@
  * 从 plugin/index.js 拆出（v1.1.2 评审 S3）。
  */
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { readOwnActivity, emptyActivity } from './activity.js';
 import { captureStatus, captureWarnings } from './capture.js';
 import { readSettingsFile } from './settings.js';
@@ -210,6 +210,38 @@ let weatherCache = null;
 let weatherFail = null;
 /** @type {{key:string,promise:Promise<object>}|null} 单飞：并发请求共用同一次尝试 */
 let weatherInflight = null;
+/**
+ * 「上次成功的天气」落盘位置（`<dataDir>/weather-cache.json`）。
+ *
+ * 为什么必须落盘：内存缓存一重启就没了。天气链路断的时候，重启后的进程既没有新数据、
+ * 也没有旧数据可兜底，卡片只能干说「取不到」——用户看到的就是「重启之后半天没天气」。
+ * 落盘之后，重启也能立刻显示上次的天气 + 它的时间，并明确标注「取不到最新的」。
+ */
+let weatherStorePath = '';
+/** 每个进程只从磁盘读一次，别每个请求都摸文件。 */
+let weatherStoreLoaded = false;
+
+/** 把上次成功的天气读回内存（没有/坏了都当没缓存，绝不抛）。 */
+function loadStoredWeather() {
+  if (weatherStoreLoaded) return;
+  weatherStoreLoaded = true;
+  if (!weatherStorePath) return;
+  try {
+    const raw = JSON.parse(readFileSync(weatherStorePath, 'utf8'));
+    if (raw && typeof raw.key === 'string' && Number.isFinite(Number(raw.at)) && raw.value) {
+      weatherCache = { key: raw.key, at: Number(raw.at), value: raw.value };
+    }
+  } catch { /* 首次运行没有这个文件，属正常 */ }
+}
+
+/** 成功后落盘；写不进去只影响"重启后能不能兜底"，不影响本次结果。 */
+function storeWeather(entry) {
+  if (!weatherStorePath) return;
+  try {
+    mkdirSync(dirname(weatherStorePath), { recursive: true });
+    writeFileSync(weatherStorePath, JSON.stringify(entry), 'utf8');
+  } catch { /* 只读目录 / 磁盘满：忽略 */ }
+}
 
 /** 上一次成功取到的值（哪怕已过期）—— 失败时用它兜底，别再让页面空着。 */
 const staleWeather = (key) => (weatherCache && weatherCache.key === key ? weatherCache.value : null);
@@ -226,6 +258,7 @@ const staleWeather = (key) => (weatherCache && weatherCache.key === key ? weathe
  */
 export async function readWeather(lat, lon) {
   const key = `${lat},${lon}`;
+  loadStoredWeather(); // 重启后先把上次成功的值捞回来，才能兜底
   if (weatherCache && weatherCache.key === key && Date.now() - weatherCache.at < WEATHER_TTL_MS) {
     return weatherCache.value;
   }
@@ -239,6 +272,7 @@ export async function readWeather(lat, lon) {
       const value = await fetchWeather(lat, lon);
       weatherCache = { key, at: Date.now(), value };
       weatherFail = null;
+      storeWeather(weatherCache);
       return value;
     } catch (error) {
       weatherFail = {
@@ -345,6 +379,8 @@ function readSessions(projDir, limit, dshHome) {
 export async function buildHud(config = {}, runtime = {}) {
   const dataDir = String(config.dataDir ?? '') || join(homedir(), '.dsh', 'lifehud');
   const settings = readSettingsFile(dataDir);
+  // 天气落盘位置（重启后靠它显示「上次的数据」）；每次 buildHud 赋值，配置变了也能跟上。
+  weatherStorePath = join(dataDir, 'weather-cache.json');
   const nowtreeDb = String(config.nowtreeDb ?? '') || defaultNowtreeDb();
   const leveldbDir = String(config.leveldbDir ?? '') || defaultLeveldbDir();
   const dshHome = String(config.dshHome ?? join(homedir(), '.dsh'));
