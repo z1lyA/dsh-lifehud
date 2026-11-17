@@ -1,7 +1,7 @@
 # AGENTS.md — dsh-lifehud 协作手册
 
 > 给接手的 AI：读这一份就能继续开发。**只写长期稳定的事实**，版本细节写 `spike/RESULT.md`。
-> 最后更新：2026-11-15 ｜ 插件版本：1.1.4
+> 最后更新：2026-11-17 ｜ 插件版本：1.1.5
 
 ---
 
@@ -82,7 +82,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 |---|---|---|---|
 | NowTree 任务 | `%APPDATA%\com.nowtree.app\nowtree.sqlite` | `node:sqlite`（Node 24 内置）`readOnly` 打开，**每请求开关一次** | 表 `transactions`；`status='active'`、`deleted=0`、按 `time_slot` 过滤 |
 | NowTree 时段分界 | `%LOCALAPPDATA%\com.nowtree.app\EBWebView\Default\Local Storage\leveldb` | 字节搜索 `nowtree_slot_bounds`，取后面的 `{"morningStart":…}` | 值可能是 UTF-16，用 latin1 + 正则兜底；读不到就回退 6/13/18 |
-| 天气 | `https://api.open-meteo.com/v1/forecast` | 无需 key；`hourly=temperature_2m,precipitation_probability,weather_code,is_day` | Host 缓存 10 分钟；换位置后置空缓存；**单次超时 3s、失败后 2 分钟冷却、并发单飞**（`readWeather`，见 §6——别把超时调大，它挡在整页首屏前面） |
+| 天气 | `https://api.open-meteo.com/v1/forecast` | 无需 key；`hourly=temperature_2m,precipitation_probability,weather_code,is_day` | Host 缓存 10 分钟；换位置后置空缓存；**单次超时 5s、失败后 2 分钟冷却、并发单飞**（`readWeather`，见 §6——别把超时调大，它挡在整页首屏前面） |
 | DSH 会话 | `$DSH_HOME/storages/session_projcache/sessions/session-<uuid>.json` | 读 json，`rows.title.val` + `rows.sessionListMetadata.val.lastPromptAt` | **sessionId 就是文件名里的 uuid**（去掉 `session-` 前缀）。不要解压 `session.v4.jsonl.zstd` |
 | 专注 / 热力 | **自采集**：`plugin/collector.ps1` → `<dataDir>/capture.db` | Host spawn 长驻 PowerShell 子进程，stdout 每 2 秒一行 JSON；Host 合并成带 `duration` 的事件写库（窗口 / AFK / 空闲强度三条流）；页面只读库 | 零安装（PowerShell 5.1 + C# P/Invoke）；`storeTitles:false` 只存应用名；**AFK 区间必须从窗口事件里扣掉**，否则 explorer.exe 会占几百分钟；采集器只能由 Host 启停（见 §6 孤儿进程）；`idle_seconds` 只存**离散档位**（`0-10/10-60/60-180/180+`），别存原始秒数 |
 | ActivityWatch（历史） | `%LOCALAPPDATA%\activitywatch\activitywatch\aw-server\peewee-sqlite.v2.db` | 只在 **首次迁移** 时读一次文件（先复制含 -wal/-shm 的副本到 tmpdir 再只读打开），把全部 bucket + `events.data` 原始 JSON + `settings.json` 的 `classes` 搬进 `capture.db` | **`eventmodel.bucket_id` 指向 `bucketmodel.key`（INTEGER），不是 `bucketmodel.id`（TEXT）**——用 id 文本查会静默返回 0 行；迁移幂等（`meta.history_imported`）；运行期**零 AW 依赖** |
@@ -102,7 +102,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 ## 6. 坑（踩过的）
 
-- **天气不可达时，别让整页陪它等超时**（2026-11-15）：`readWeather()` 原来是「超时 6s + 失败不重试」，于是天气一断，**每一次** `/hud` 都要 6.02s（实测四连），任务/会话/专注/热力全跟着慢——用户体感就是「重启后 LifeHud 加载变慢」。现在：**超时 3s**（健康时实测 1–2.3s 就够）+ **失败后 2 分钟冷却**（冷却期内直接返回上次的值或 null，毫秒返回，不再打网络）+ **并发单飞**（N 个并发只打一次）。回归用例：`probe-hud.mjs` 最后那组 10 条（含 Date.now 快进验证冷却到期会重试、stub fetch 验单飞）。**判活口径**：`/hud` 的 `weatherDiag` 字段——字段在＝新代码生效，缺失＝进程里还是旧 `hud.js`（见上一条）。
+- **天气不可达时，别让整页陪它等超时**（2026-11-15）：`readWeather()` 原来是「超时 6s + 失败不重试」，于是天气一断，**每一次** `/hud` 都要 6.02s（实测四连），任务/会话/专注/热力全跟着慢——用户体感就是「重启后 LifeHud 加载变慢」。现在：**超时 5s**（2026-11-17 从 3s 调回：同链路实测耗时 0.27/0.33/0.48/**2.04/2.75** 秒，3s 只比长尾多 0.25s，太贴边，会把本来能成的请求判成超时）+ **失败后 2 分钟冷却**（冷却期内直接返回上次的值或 null，毫秒返回，不再打网络）+ **并发单飞**（N 个并发只打一次）。回归用例：`probe-hud.mjs` 最后那组 10 条（含 Date.now 快进验证冷却到期会重试、stub fetch 验单飞）。**判活口径**：`/hud` 的 `weatherDiag` 字段——字段在＝新代码生效，缺失＝进程里还是旧 `hud.js`（见上一条）。设置页诊断区会把它翻成一行中文（正常/用缓存/取不到 + 时间）。
 - **Host 代码没有热更新**。改完必须 remove + install，否则你以为改了其实没生效。
 - **但 remove → install 也不保证重新 import `plugin/lib/*.js`**（2026-11-15 实测）：Cordis 确实重新 apply 了入口，Node 的 ESM 缓存却按 URL 命中，**已经求值过的 `lib/*.js` 不会再跑一遍**。症状：`install_bundle` 返回 `changed:true`、`version` 也是新的，但 `/hud` 的 `version` 还是旧值、新加副作用不出现（当时删掉 `meta.miDeviceId` 再 `?force=1`，新代码会立刻重写它，结果没写 → 证明跑的仍是旧 `weight.js`）。**判别法**：找一个「只有新代码才会做」的副作用去验，或直接看 `/hud` 的 `version`；别拿 install 的返回值当生效证据。**真要让 Host 改动生效：重启 DSH**（重启后本会话可恢复）。
 - **插件路由不设防**（见约定 2）。
@@ -143,7 +143,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - ✅ HUD 自动刷新（v1.1.1）：Client `useHud()` 每 5 分钟静默重取一次（页面隐藏时不发请求，`visibilitychange` 回页面补一次；三道护栏防并发：hidden / `prefetch` 在飞 / `HUD_TTL` 未过期都跳过）。
 - ✅ 体重同步：Host 每 10 分钟自动拉一次小米云（定时器可 dispose）；页面「刷新」按钮带 `?force=1` 立即拉，**这是"刚踩秤就能看到"的主路径**。
 - ✅ 体重健壮性（v1.1.3）：会话过期不再被误报成「云端异常」（426/SERVICETOKEN_EXPIRED → `session-expired`，卡片提示「请重新登录」）；设备指纹改成持久固定（见 §6），避免被小米风控当成盗号而提前掐会话。
-- ✅ 天气健壮性（v1.1.4）：单次取值超时 3s、失败后 2 分钟冷却、并发单飞（见 §6）。天气不可达时 `/hud` 毫秒返回（天气卡显示「取不到」），不会再让整页等满超时。`/hud` 另暴露 `weatherDiag`（缓存/失败/超时/冷却的生效值）用于判断进程里跑的是哪一版代码。
+- ✅ 天气健壮性（v1.1.4 / v1.1.5）：单次取值超时 5s、失败后 2 分钟冷却、并发单飞（见 §6）。天气不可达时 `/hud` 毫秒返回（天气卡显示「取不到」），不会再让整页等满超时。`/hud` 暴露 `weatherDiag`（缓存/失败/超时/冷却的生效值），设置页诊断区把它翻成一行中文（正常 / 用上次的数据 / 取不到 + 时间），也用来判断进程里跑的是哪一版代码。
 - ✅ 检查更新（v1.1.2）：页面「设置 → 版本与更新」手动点才联网（**不做启动自动检查**）；Host 读 GitHub Release/Tag，取最大语义版本，有 Release 就显示发布日期与正文；`/hud` 新增 `version` 字段（Host 版本），页面拿它和 `BUILD` 对比提示「页面资源旧了」；上次结果存 localStorage（键 `lifehud.update.v1`，版本变了自动作废，只回显不发请求）。
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
 - ⚠️ 天气的"一句话"是规则拼的，不是模型生成。
