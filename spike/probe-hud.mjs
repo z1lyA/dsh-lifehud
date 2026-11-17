@@ -324,7 +324,7 @@ try {
     try {
       // 1) 超时与冷却的数值（曾经的 6s 就是慢的根源）
       const st0 = weatherStatus();
-      check('天气超时 = 3s（不是 6s）', st0.timeoutMs === 3000, String(st0.timeoutMs));
+      check('天气超时 = 5s（给长尾留余量；不是原来的 6s，也不是过紧的 3s）', st0.timeoutMs === 5000, String(st0.timeoutMs));
       check('天气失败冷却 = 2 分钟', st0.cooldownMs === 120000, String(st0.cooldownMs));
 
       // 2) 失败一次：抛错 + 只打一次网络 + 记进失败状态
