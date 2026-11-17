@@ -307,6 +307,10 @@ try {
     const LAT = 39.9;
     const LON = 116.4;
 
+    // 把「天气落盘路径」指回临时目录：否则下面 stub 成功时会把假数据写进真实 dataDir，
+    // 下一轮真机就会读到它。（buildHud 是唯一设置该路径的入口，所以重跑一次 temp 配置即可。）
+    await buildHud(config);
+
     /** 一份最小的 open-meteo 成功响应。 */
     const okPayload = () => ({
       hourly: {
