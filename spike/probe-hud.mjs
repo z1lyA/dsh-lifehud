@@ -383,6 +383,33 @@ try {
       const [a, b] = await Promise.all([run(), run()]);
       check('并发两次只打一次网络（单飞）', calls === 1, `calls=${calls}`);
       check('两个并发拿到同一份结果', a?.hourly?.length === 2 && b?.hourly?.length === 2);
+
+      // 8) 当前小时按请求时刻重算：缓存可能已经放了几小时，不能把「现在」冻在取数那一刻
+      //    （2026-11-18 真机踩到：13:22 卡片还显示 09:00 的 22.4℃）
+      clearWeatherCache();
+      const pad = (n) => String(n).padStart(2, '0');
+      const d0 = new Date();
+      const stamp = (h) => `${d0.getFullYear()}-${pad(d0.getMonth() + 1)}-${pad(d0.getDate())}T${pad(h)}:00`;
+      const hours = Array.from({ length: 24 }, (_, h) => h);
+      globalThis.fetch = async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          hourly: {
+            time: hours.map(stamp),
+            temperature_2m: hours.map((h) => 20 + h / 10),
+            precipitation_probability: hours.map(() => 0),
+            weather_code: hours.map(() => 0),
+            is_day: hours.map(() => 1),
+          },
+          daily: { sunrise: [stamp(6)], sunset: [stamp(18)] },
+        }),
+      });
+      const hourHud = await buildHud(config);
+      const wantHour = new Date().getHours();
+      check('当前小时按请求时刻重算（不是冻在取数那一刻）',
+        hourHud.weather?.nowIndex === wantHour,
+        `nowIndex=${hourHud.weather?.nowIndex} 期望=${wantHour}`);
     } finally {
       globalThis.fetch = realFetch;
       Date.now = realNow;

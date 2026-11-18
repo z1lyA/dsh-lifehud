@@ -204,6 +204,29 @@ async function fetchWeather(lat, lon) {
   };
 }
 
+/**
+ * 让「当前小时」跟着真实时间走。
+ *
+ * 缓存的（以及落盘的那份）是**整个 payload**，里面的 `nowIndex`/`now`/`nowText` 是
+ * **取数那一刻**算好的。直接拿去渲染，断线几小时后卡片就会冻在取数时的小时上——
+ * 2026-11-18 真机踩到：13:22 卡片还停在 09:00 的 22.4℃。
+ * 这里按「今天 + 当前小时」重新定位当前点；越界就退到最接近的一个。
+ * @param {object|null} weather @returns {object|null}
+ */
+function refreshCurrentHour(weather) {
+  const hourly = Array.isArray(weather?.hourly) ? weather.hourly : [];
+  if (hourly.length === 0) return weather;
+  const now = new Date();
+  const day = now.getDate();
+  const hour = now.getHours();
+  let idx = hourly.findIndex((p) => p.day === day && p.h === hour);
+  if (idx < 0) idx = hourly.findIndex((p) => p.day === day && p.h > hour);
+  if (idx < 0) idx = Math.min(hour, hourly.length - 1);
+  const current = hourly[idx];
+  if (!current) return weather;
+  return { ...weather, nowIndex: idx, now: current.t, nowText: current.text, nowIcon: current.icon };
+}
+
 /** @type {{key:string,at:number,value:object}|null} */
 let weatherCache = null;
 /** @type {{key:string,at:number,message:string}|null} 上一次失败（冷却窗口从这里算起） */
@@ -436,7 +459,8 @@ export async function buildHud(config = {}, runtime = {}) {
       boundsSource: discovered ? 'nowtree' : 'default',
     },
     tasks: { slot, label: SLOT_LABEL[slot] ?? slot, range: slotRange(slot, bounds), items: tasks },
-    weather,
+    // 当前小时按请求时刻重算：缓存/落盘的数据可能已经放了几小时，别把「现在」冻在取数那一刻。
+    weather: refreshCurrentHour(weather),
     location: { latitude: lat, longitude: lon, name: settings.locationName ?? null },
     sessions,
     focus: activity.focus,
