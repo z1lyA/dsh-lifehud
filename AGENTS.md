@@ -104,7 +104,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 - **天气不可达时，别让整页陪它等超时**（2026-11-15）：`readWeather()` 原来是「超时 6s + 失败不重试」，于是天气一断，**每一次** `/hud` 都要 6.02s（实测四连），任务/会话/专注/热力全跟着慢——用户体感就是「重启后 LifeHud 加载变慢」。现在：**超时 5s**（2026-11-17 从 3s 调回：同链路实测耗时 0.27/0.33/0.48/**2.04/2.75** 秒，3s 只比长尾多 0.25s，太贴边，会把本来能成的请求判成超时）+ **失败后 2 分钟冷却**（冷却期内直接返回上次的值或 null，毫秒返回，不再打网络）+ **并发单飞**（N 个并发只打一次）；另外**上次成功的天气会落盘到 `<dataDir>/weather-cache.json`**（原来只在内存，一重启就没了 —— 于是断线 + 重启 = 既没新数据也没旧数据可兜底，卡片只能干说「取不到」）。回归用例：`probe-hud.mjs` 最后那组 10 条（含 Date.now 快进验证冷却到期会重试、stub fetch 验单飞）。**判活口径**：`/hud` 的 `weatherDiag` 字段——字段在＝新代码生效，缺失＝进程里还是旧 `hud.js`（见上一条）。天气卡底部会显示数据新旧（「取不到最新的 · 显示的是 12:47 的数据」），设置页诊断区另有一行。
 - **缓存里的「当前小时」必须按请求时刻重算**（2026-11-18）：天气 payload 是整包缓存的，`nowIndex`/`now`/`nowText` 是**取数那一刻**算好的。断线几小时后直接渲染，卡片会冻在取数时的小时上——真机踩到过「13:22 还显示 09:00 的 22.4℃」。现在 `buildHud` 出口统一过一遍 `refreshCurrentHour()`，按「今天 + 当前小时」重新定位当前点。回归用例：`probe-hud.mjs` 的「当前小时按请求时刻重算」。
-- **倒计时的计时器和提醒都必须活在 Host**（2026-11-19）：用户会切去对话——那一刻 LifeHud 的 React 组件被**卸载**，纯前端 `setInterval` 连同提醒一起消失。所以计时器在 `lib/countdown.js`（1 秒 tick，状态落盘 `<dataDir>/countdown.json`），到点用 **Windows PowerShell 5.1 + WinRT toast** 发系统通知。两个坑：① 中文文案必须走 **`-EncodedCommand`**（UTF-16LE base64）——写 `.ps1` 文件或直接塞进命令行都会乱码（PS 5.1 按 ANSI 读）；② 通知**入系统库有 1–3 秒延迟**，`wpndatabase.db` 里查不到不代表没发出去。AppID 用 `com.deepseek.dsh`（零配置，通知里显示 DeepSeek Harness）。验证：`spike/probe-countdown.mjs`（31 项，注入假 notifier 断言文案与"只发一次"）。
+- **倒计时的计时器和提醒都必须活在 Host**（2026-11-19）：用户会切去对话——那一刻 LifeHud 的 React 组件被**卸载**，纯前端 `setInterval` 连同提醒一起消失。所以计时器在 `lib/countdown.js`（1 秒 tick，状态落盘 `<dataDir>/countdown.json`），到点用 **Windows PowerShell 5.1 + WinRT toast** 发系统通知。两个坑：① 中文文案必须走 **`-EncodedCommand`**（UTF-16LE base64）——写 `.ps1` 文件或直接塞进命令行都会乱码（PS 5.1 按 ANSI 读）；② 通知**入系统库有 1–3 秒延迟**，`wpndatabase.db` 里查不到不代表没发出去。AppID 用 `com.deepseek.dsh`（零配置，通知里显示 DeepSeek Harness）。**第三个坑（2026-11-19 实测）**：`spawn` 绝对不能带 `detached: true`——四组对照里只有「不 detached」的两组真正进了系统，带 detached 的退出码 0 但 toast 静默丢失。现在固定 `stdio: ['ignore','ignore','pipe']` 并把 stderr 收进 `notifyLast`（`/lifehud/api/countdown` 里能看到 `{at, code, err}`），出问题不用猜。验证：`spike/probe-countdown.mjs`（31 项，注入假 notifier 断言文案与"只发一次"）。
 - **Host 代码没有热更新**。改完必须 remove + install，否则你以为改了其实没生效。
 - **但 remove → install 也不保证重新 import `plugin/lib/*.js`**（2026-11-15 实测）：Cordis 确实重新 apply 了入口，Node 的 ESM 缓存却按 URL 命中，**已经求值过的 `lib/*.js` 不会再跑一遍**。症状：`install_bundle` 返回 `changed:true`、`version` 也是新的，但 `/hud` 的 `version` 还是旧值、新加副作用不出现（当时删掉 `meta.miDeviceId` 再 `?force=1`，新代码会立刻重写它，结果没写 → 证明跑的仍是旧 `weight.js`）。**判别法**：找一个「只有新代码才会做」的副作用去验，或直接看 `/hud` 的 `version`；别拿 install 的返回值当生效证据。**真要让 Host 改动生效：重启 DSH**（重启后本会话可恢复）。
 - **插件路由不设防**（见约定 2）。
@@ -222,6 +222,9 @@ Client  ──POST /lifehud/api/countdown {action, ms}──►  lib/countdown.j
 - **"离开期间到点"补偿**：`configureCountdown()`（Host 启动时调一次）发现 `running` 且 `endsAt` 已过 →
   置 `done` 并发一条「…在你离开时到点了（HH:mm）」，然后停在 00:00 等用户处理。
 - **前端只做两件事**：本地每秒重绘剩余时间（`endsAt - now`）、按钮点按 POST。真实状态永远以 Host 为准。
+  **走到 0 时必须主动 `GET /lifehud/api/countdown` 重取**（每 700ms 重试，最多 12 次）：否则卡片会停在「运行中 00:00」，
+  最长要等下一次 `/hud`（5 分钟）或切走再回来（2026-11-19 用户实测踩到）。结束态除「再来一次」还要有「重新设置」（`cancel`）。
+  进「自定义」时滚轮一律重置为 `00:00:00`，不沿用上一次的设定。
 - **视觉规格（2026-11-19 用户嫌"排版一般"后重做，别退回去）**：
   1. **数字是唯一主角**：`MM:SS` 52px / `H:MM:SS` 44px（按位数自适应，窄格不顶边）、`tabular-nums`、`letter-spacing:-0.035em`；
   2. 上方一枚 **11px 状态徽标**（运行中 / 已暂停 / 已结束），字距 0.14em、opacity .5——只做层级标签，不做标题；
