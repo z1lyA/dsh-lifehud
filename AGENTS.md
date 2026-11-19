@@ -1,7 +1,7 @@
 # AGENTS.md — dsh-lifehud 协作手册
 
 > 给接手的 AI：读这一份就能继续开发。**只写长期稳定的事实**，版本细节写 `spike/RESULT.md`。
-> 最后更新：2026-11-17 ｜ 插件版本：1.1.5
+> 最后更新：2026-11-19 ｜ 插件版本：1.1.6
 
 ---
 
@@ -12,7 +12,7 @@
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
 | 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 48 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-countdown.mjs`（倒计时状态机 31 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 48 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
 | 小米云会话过期了 | `node notes/tools/mi-login.mjs`：扫码/链接确认重登，自动写回 `mi-session.json`（**本地脚本，未随仓库发布**）。备份依赖：`mi-login-qr.png`。细节见 `docs/小米云取数.md` §4 |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
@@ -104,6 +104,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 - **天气不可达时，别让整页陪它等超时**（2026-11-15）：`readWeather()` 原来是「超时 6s + 失败不重试」，于是天气一断，**每一次** `/hud` 都要 6.02s（实测四连），任务/会话/专注/热力全跟着慢——用户体感就是「重启后 LifeHud 加载变慢」。现在：**超时 5s**（2026-11-17 从 3s 调回：同链路实测耗时 0.27/0.33/0.48/**2.04/2.75** 秒，3s 只比长尾多 0.25s，太贴边，会把本来能成的请求判成超时）+ **失败后 2 分钟冷却**（冷却期内直接返回上次的值或 null，毫秒返回，不再打网络）+ **并发单飞**（N 个并发只打一次）；另外**上次成功的天气会落盘到 `<dataDir>/weather-cache.json`**（原来只在内存，一重启就没了 —— 于是断线 + 重启 = 既没新数据也没旧数据可兜底，卡片只能干说「取不到」）。回归用例：`probe-hud.mjs` 最后那组 10 条（含 Date.now 快进验证冷却到期会重试、stub fetch 验单飞）。**判活口径**：`/hud` 的 `weatherDiag` 字段——字段在＝新代码生效，缺失＝进程里还是旧 `hud.js`（见上一条）。天气卡底部会显示数据新旧（「取不到最新的 · 显示的是 12:47 的数据」），设置页诊断区另有一行。
 - **缓存里的「当前小时」必须按请求时刻重算**（2026-11-18）：天气 payload 是整包缓存的，`nowIndex`/`now`/`nowText` 是**取数那一刻**算好的。断线几小时后直接渲染，卡片会冻在取数时的小时上——真机踩到过「13:22 还显示 09:00 的 22.4℃」。现在 `buildHud` 出口统一过一遍 `refreshCurrentHour()`，按「今天 + 当前小时」重新定位当前点。回归用例：`probe-hud.mjs` 的「当前小时按请求时刻重算」。
+- **倒计时的计时器和提醒都必须活在 Host**（2026-11-19）：用户会切去对话——那一刻 LifeHud 的 React 组件被**卸载**，纯前端 `setInterval` 连同提醒一起消失。所以计时器在 `lib/countdown.js`（1 秒 tick，状态落盘 `<dataDir>/countdown.json`），到点用 **Windows PowerShell 5.1 + WinRT toast** 发系统通知。两个坑：① 中文文案必须走 **`-EncodedCommand`**（UTF-16LE base64）——写 `.ps1` 文件或直接塞进命令行都会乱码（PS 5.1 按 ANSI 读）；② 通知**入系统库有 1–3 秒延迟**，`wpndatabase.db` 里查不到不代表没发出去。AppID 用 `com.deepseek.dsh`（零配置，通知里显示 DeepSeek Harness）。验证：`spike/probe-countdown.mjs`（31 项，注入假 notifier 断言文案与"只发一次"）。
 - **Host 代码没有热更新**。改完必须 remove + install，否则你以为改了其实没生效。
 - **但 remove → install 也不保证重新 import `plugin/lib/*.js`**（2026-11-15 实测）：Cordis 确实重新 apply 了入口，Node 的 ESM 缓存却按 URL 命中，**已经求值过的 `lib/*.js` 不会再跑一遍**。症状：`install_bundle` 返回 `changed:true`、`version` 也是新的，但 `/hud` 的 `version` 还是旧值、新加副作用不出现（当时删掉 `meta.miDeviceId` 再 `?force=1`，新代码会立刻重写它，结果没写 → 证明跑的仍是旧 `weight.js`）。**判别法**：找一个「只有新代码才会做」的副作用去验，或直接看 `/hud` 的 `version`；别拿 install 的返回值当生效证据。**真要让 Host 改动生效：重启 DSH**（重启后本会话可恢复）。
 - **插件路由不设防**（见约定 2）。
@@ -133,9 +134,10 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 ## 7. 当前状态
 
-- ✅ 七张卡：当前时段任务、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图 + 最长一段，**v1.1.1 起数据自己采**）、热力日历（当月 · GitHub 风格）、相框、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线）**。
+- ✅ 七张卡：当前时段任务、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图 + 最长一段，**v1.1.1 起数据自己采**）、热力日历（当月 · GitHub 风格）、**倒计时（v1.1.6：单个 · 一段时长 · Host 侧计时 · 到点弹系统通知）**、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线）**。
+  （相框卡在 v1.1.6 移除：上传/删除路由与 `lifehud-photo.*` 存储一并删掉，已存在的照片文件不自动删、只是不再读。）
   「网页对话 ↗」是工具条上的外链按钮（`window.open`），**不是卡片**。
-- ✅ 布局：flex 便当盒两行 —— 行 1 = 天气(宽) · 体重 · 任务；行 2 = 专注 · 会话 · 相框 · 热力。
+- ✅ 布局：flex 便当盒两行 —— 行 1 = 天气(宽) · 体重 · 任务；行 2 = 专注 · 会话 · 倒计时 · 热力。
   （体重与热力 2026-11-09 换过位置：体重进更高的第一行、热力下到第二行第四格。）
   体重卡用 `Card` 的 `cellStyle` 给了 `flex: 1.2 1 0`（比任务卡略宽），要再调就改这一个数。
 - ✅ 设置窗口：背景（无/渐变/纯色/图片 URL）、天气小时数、**体重卡开关**、**专注卡采集开关**（v1.1.1，只管展示）、网页对话地址、定位、诊断。
@@ -200,6 +202,29 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
   5. 颜色只用 `currentColor` / `rgba(128,128,128,α)`，深/浅主题都要能读。
 - **改它的入口**：`client.js` 的 `useWeight` / `WeightChart` / `WeightBody`；Host 侧 `plugin/lib/weight.js` 的 `readWeight` / `pullWeight` / `miFailureReason`。
 - **验证**：`node spike/probe-weight.mjs`（48 项，含幂等/缺失日/stale/TTL/失败分类/设备指纹/路由契约）。
+
+### 倒计时卡怎么工作（v1.1.6，重要）
+
+```
+Client  ──POST /lifehud/api/countdown {action, ms}──►  lib/countdown.js（Host）
+   ▲                                                      │ 1 秒 tick，写 <dataDir>/countdown.json
+   └────────── /hud 里带 countdown 字段（权威状态）◄───────┘
+                                                          │ 到点
+                                                          ▼
+                                        Windows PowerShell 5.1 + WinRT toast（系统通知）
+```
+
+- **为什么在 Host**：页面切去对话 = 组件卸载 = 前端定时器消失。要"页面不在也提醒"，只能 Host 计时。
+- **状态机**：`idle → running → (paused ⇄ running) → done →（再来一次）running`；`cancel` 任何时候回 `idle`。
+- **落盘**：`<dataDir>/countdown.json`，字段 `{phase,totalMs,endsAt,remainingMs,startedAt,finishedAt,notified,updatedAt}`。
+  `running` 时以 `endsAt` 为准（`remainingMs` 只是快照）；`paused` 时以 `remainingMs` 为准。
+- **上限 24 小时**：超过 `countdownStart` 直接抛错 → 路由返回 400。
+- **"离开期间到点"补偿**：`configureCountdown()`（Host 启动时调一次）发现 `running` 且 `endsAt` 已过 →
+  置 `done` 并发一条「…在你离开时到点了（HH:mm）」，然后停在 00:00 等用户处理。
+- **前端只做两件事**：本地每秒重绘剩余时间（`endsAt - now`）、按钮点按 POST。真实状态永远以 Host 为准。
+- **改它**：`lib/countdown.js`（状态机/落盘/通知）、`index.js`（路由与 `/hud` 注入）、`client.js` 的 `CountdownBody`。
+- **验证**：`node spike/probe-countdown.mjs`（31 项）。真通知链路另外手工验过一次：
+  2 秒倒计时 → 系统通知库里出现两条 `倒计时结束`（`wpndatabase.db`，**入库有 1–3 秒延迟**）。
 
 ### 内嵌网页是怎么做到的（重要）
 
@@ -283,7 +308,7 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
 | 类型 | 放哪 | 说明 |
 |---|---|---|
 | 调研笔记、心智记录、布局原型、写真实作息/体型的文档 | 仓库内的 `notes/`（`.gitignore` 整目录忽略） | 本地可见、和代码放一起；`git status` 不会提示，永远提交不上去 |
-| 运行时私人数据（`mi-session.json`、体重库、专注采集库 `capture.db`、设置、相框） | `~/.dsh/lifehud`（仓库外） | 插件自己读写，`.gitignore` 也挡了同名文件 |
+| 运行时私人数据（`mi-session.json`、体重库、专注采集库 `capture.db`、设置、倒计时状态 `countdown.json`） | `~/.dsh/lifehud`（仓库外） | 插件自己读写，`.gitignore` 也挡了同名文件 |
 
 所以对本仓库的唯一要求是：**别把上面两类东西 commit 进来**。提交前跑一次：
 
