@@ -81,6 +81,9 @@ function xmlEscape(text) {
  * 失败一律吞掉——提醒没发出去，绝不能反过来影响计时器。
  * @param {string} title @param {string} body
  */
+/** 最近一次通知投递结果（诊断用：看子进程到底有没有起来、报了什么）。 */
+let notifyLast = null;
+
 function toast(title, body) {
   let ps = join(process.env.WINDIR ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const xml = '<toast activationType="foreground" scenario="reminder"><visual>'
@@ -92,20 +95,31 @@ function toast(title, body) {
     '[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null',
     '$x = New-Object Windows.Data.Xml.Dom.XmlDocument',
     `$x.LoadXml(@'\n${xml}\n'@)`,
-    '$n = New-Object Windows.UI.Notifications.ToastNotification $x',
+    '$n = new-object Windows.UI.Notifications.ToastNotification $x',
     // 用 DSH 自己的 AppID：零配置，通知里显示 DeepSeek Harness
     `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('com.deepseek.dsh').Show($n)`,
   ].join('\n');
   const encoded = Buffer.from(script, 'utf16le').toString('base64');
   try {
+    // ⚠️ 不要加 detached —— 2026-11-19 四组对照实测：`detached:true` + `stdio:'ignore'` 时
+    // PowerShell 退出码 0，toast **根本没进系统**（只有「不 detached」的两组到达）。
+    // 也保留 stderr 便于诊断：stdout 丢弃、stderr 管道读回来记进 notifyLast。
     const child = spawn(ps, ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded], {
       windowsHide: true,
-      stdio: 'ignore',
-      detached: true,
+      stdio: ['ignore', 'ignore', 'pipe'],
     });
-    child.on?.('error', () => {});
-    child.unref?.();
-  } catch { /* 发通知失败不影响任何状态 */ }
+    let err = '';
+    child.stderr?.on('data', (chunk) => { err += chunk.toString(); });
+    child.on('error', (error) => {
+      notifyLast = { at: Date.now(), code: 'spawn-error', err: String(error?.message ?? error).slice(0, 200) };
+    });
+    child.on('close', (code) => {
+      const clean = err.replace(/#< CLIXML[\s\S]*$/, '').replace(/\s+/g, ' ').trim();
+      notifyLast = { at: Date.now(), code, err: clean.slice(0, 200) };
+    });
+  } catch (error) {
+    notifyLast = { at: Date.now(), code: 'spawn-error', err: String(error).slice(0, 200) };
+  }
 }
 
 /** 探针用：替换通知实现。传 null 恢复默认。 */
@@ -194,6 +208,8 @@ export function countdownStatus() {
     finishedAt: Number(state.finishedAt) || 0,
     maxMs: COUNTDOWN_MAX_MS,
     serverNow,
+    // 诊断：最近一次系统通知的投递结果（null = 还没发过）
+    notifyLast,
   };
 }
 
