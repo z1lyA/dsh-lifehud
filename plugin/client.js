@@ -6,7 +6,7 @@
  *
  * 布局：flex 便当盒，两行
  *   行 1（更高）：天气(宽) · 体重(v1.1.0，可关) · 任务
- *   行 2：专注 · 会话 · 相框 · 热力
+ *   行 2：专注 · 会话 · 倒计时 · 热力
  *
  * 重要：这个包可能被执行不止一次（热装插件后 DSH 的 client-modules 会重复求值），
  * 重复调用 __ModuleLoader__.load 会抛 "duplicate factory registration"，
@@ -24,10 +24,9 @@ if (!window.__lifehudClientRegistered) {
       const PANEL_ID = 'lifehud';
       const NS = 'lifehud';
       /** 客户端构建标记：改这里 → 页面上能一眼看出加载的是哪一版。 */
-      const BUILD = '1.1.5';
+      const BUILD = '1.1.6';
       const HUD_URL = '/lifehud/api/hud';
       const WEIGHT_URL = '/lifehud/api/weight';
-      const PHOTO_URL = '/lifehud/api/photo';
       const SETTINGS_URL = '/lifehud/api/settings';
       const SESSION_EXISTS_URL = '/lifehud/api/session-exists';
       const UPDATE_URL = '/lifehud/api/update';
@@ -906,75 +905,166 @@ if (!window.__lifehudClientRegistered) {
         ]);
       }
 
-      /* ---------------------------------------------------------------- 相框 */
+      /* ---------------------------------------------------------------- 倒计时 */
 
-      function PhotoBody() {
-        const [src, setSrc] = React.useState(null);
+      const COUNTDOWN_URL = '/lifehud/api/countdown';
+      const PRESETS = [5, 15, 25, 45];
+
+      /** 毫秒 → `25:00`；超过 1 小时 → `1:25:00`。 */
+      function fmtCountdown(ms) {
+        const total = Math.max(0, Math.ceil(ms / 1000));
+        const hh = Math.floor(total / 3600);
+        const mm = String(Math.floor((total % 3600) / 60)).padStart(2, '0');
+        const ss = String(total % 60).padStart(2, '0');
+        return hh > 0 ? `${hh}:${mm}:${ss}` : `${mm}:${ss}`;
+      }
+
+      /** 时/分/秒三段选择器里的一段。 */
+      function numSelect(value, max, onChange, unit) {
+        return h('label', { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: T.text3 } }, [
+          h('select', {
+            value,
+            onChange: (event) => onChange(Number(event.target.value)),
+            style: {
+              fontSize: 12.5, color: T.text, background: '#2c2c2e', border: 'none',
+              borderRadius: 8, padding: '4px 6px', cursor: 'pointer',
+            },
+          }, Array.from({ length: max + 1 }, (_, v) => h('option', { key: v, value: v }, String(v).padStart(2, '0')))),
+          unit,
+        ]);
+      }
+
+      /**
+       * 倒计时卡（v1.1.6）。状态以 Host 为准（`/hud` 的 countdown 字段下发），
+       * 页面只做两件事：本地每秒重绘剩余时间、把按钮点按 POST 给 Host。
+       * 计时真值在 Host —— 这样切去对话（本组件被卸载）也不影响到点提醒。
+       */
+      function CountdownBody(props) {
+        const [st, setSt] = React.useState(props.initial ?? { phase: 'idle', totalMs: 0, remainingMs: 0 });
+        const [now, setNow] = React.useState(Date.now());
         const [busy, setBusy] = React.useState(false);
         const [err, setErr] = React.useState(null);
+        const [custom, setCustom] = React.useState(false);
+        const [hh, setHh] = React.useState(0);
+        const [mm, setMm] = React.useState(25);
+        const [ss, setSs] = React.useState(0);
 
-        const load = React.useCallback(async () => {
-          try {
-            const res = await fetch(PHOTO_URL, { cache: 'no-store' });
-            if (res.ok) setSrc(URL.createObjectURL(await res.blob()));
-            else setSrc(null);
-          } catch { setSrc(null); }
-        }, []);
+        React.useEffect(() => { if (props.initial) setSt(props.initial); }, [props.initial]);
 
+        // 只有跑着的时候才每秒重绘
         React.useEffect(() => {
-          load();
-          return () => { setSrc((c) => { if (c) URL.revokeObjectURL(c); return null; }); };
-        }, [load]);
+          if (st.phase !== 'running') return undefined;
+          const t = setInterval(() => setNow(Date.now()), 1000);
+          return () => clearInterval(t);
+        }, [st.phase]);
 
-        const onPick = async (event) => {
-          const file = event.target.files?.[0];
-          if (!file) return;
+        const post = async (action, ms) => {
           setBusy(true); setErr(null);
           try {
-            const dataUrl = await new Promise((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(String(reader.result));
-              reader.onerror = () => reject(new Error('读取图片失败'));
-              reader.readAsDataURL(file);
-            });
-            const res = await fetch(PHOTO_URL, {
-              method: 'POST', headers: { 'content-type': 'application/json' },
-              body: JSON.stringify({ data: dataUrl }),
+            const res = await fetch(COUNTDOWN_URL, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ action, ms }),
             });
             const payload = await res.json();
-            if (!payload.ok) throw new Error(payload.error ?? '上传失败');
-            await load();
-          } catch (error) {
-            setErr(error?.message ?? String(error));
+            if (!payload.ok) throw new Error(payload.error ?? '操作失败');
+            setSt(payload.countdown);
+            setNow(Date.now());
+          } catch (e) {
+            setErr(e?.message ?? String(e));
           } finally {
             setBusy(false);
-            event.target.value = '';
           }
         };
 
-        const onRemove = async () => {
-          setBusy(true);
-          try { await fetch(PHOTO_URL, { method: 'DELETE' }); setSrc(null); } finally { setBusy(false); }
-        };
+        const remaining = st.phase === 'running'
+          ? Math.max(0, (st.endsAt || 0) - now)
+          : Math.max(0, st.remainingMs || 0);
+        const pct = st.totalMs > 0 ? Math.max(0, Math.min(100, (remaining / st.totalMs) * 100)) : 0;
+        const link = (label, onClick) => h('button', {
+          type: 'button', style: { ...S.btn, textDecoration: 'underline' }, onClick, disabled: busy,
+        }, label);
 
-        return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } }, [
+        // 待设置：预设在前，自定义折叠在后
+        if (st.phase === 'idle') {
+          const totalMs = ((hh * 3600 + mm * 60 + ss) * 1000);
+          return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } }, [
+            h('div', { key: 'hint', style: { fontSize: 12.5, color: T.text3, marginBottom: 10 } },
+              '设一段时长，到点弹系统通知（最多 24 小时）'),
+            h('div', { key: 'p', style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+              PRESETS.map((v) => h('button', {
+                key: v,
+                type: 'button',
+                disabled: busy,
+                onClick: () => post('start', v * 60000),
+                style: {
+                  fontSize: 12.5, color: T.text2, background: 'rgba(128,128,128,0.16)',
+                  border: 'none', borderRadius: 980, padding: '5px 12px', cursor: 'pointer',
+                },
+              }, `${v} 分钟`))),
+            h('div', { key: 'c', style: { marginTop: 10, flex: 'none' } },
+              link(custom ? '收起自定义' : '自定义…', () => setCustom((v) => !v))),
+            custom ? h('div', { key: 'cf', style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' } }, [
+              numSelect(hh, 23, setHh, '时'),
+              numSelect(mm, 59, setMm, '分'),
+              numSelect(ss, 59, setSs, '秒'),
+              h('button', {
+                key: 'go',
+                type: 'button',
+                disabled: busy || totalMs <= 0,
+                onClick: () => post('start', totalMs),
+                style: {
+                  fontSize: 12.5, color: '#000', background: T.text, border: 'none',
+                  borderRadius: 980, padding: '5px 14px', cursor: 'pointer',
+                },
+              }, '开始'),
+            ]) : null,
+            err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null,
+          ]);
+        }
+
+        // 已结束：停在 00:00，附「X 点结束 · 再来一次」
+        if (st.phase === 'done') {
+          return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'center' } }, [
+            h('div', {
+              key: 'n',
+              style: { fontSize: 40, fontWeight: 600, lineHeight: 1, letterSpacing: '-0.03em', color: '#ff453a', fontVariantNumeric: 'tabular-nums' },
+            }, '00:00'),
+            h('div', { key: 't', style: { marginTop: 10, fontSize: 12.5, color: T.text3 } },
+              h('button', {
+                key: 'r',
+                type: 'button',
+                disabled: busy,
+                onClick: () => post('start', st.totalMs),
+                style: { ...S.btn, textDecoration: 'underline' },
+              }, `${hhmm(st.finishedAt)} 结束 · 再来一次`)),
+            err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null,
+          ]);
+        }
+
+        // 跑着 / 暂停：大数字 + 细进度条 + 暂停·继续 / 取消
+        return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'center' } }, [
           h('div', {
-            key: 'f',
+            key: 'n',
+            style: { fontSize: 40, fontWeight: 600, lineHeight: 1, letterSpacing: '-0.03em', fontVariantNumeric: 'tabular-nums' },
+          }, fmtCountdown(remaining)),
+          h('div', {
+            key: 'bar',
+            style: { height: 4, borderRadius: 2, background: 'rgba(128,128,128,0.22)', marginTop: 12, overflow: 'hidden' },
+          }, h('div', {
             style: {
-              flex: '1 1 auto', minHeight: 80, width: '100%', borderRadius: 16, overflow: 'hidden',
-              background: T.line, display: 'flex', alignItems: 'center', justifyContent: 'center',
+              width: `${pct}%`, height: '100%', borderRadius: 2, background: T.text2,
+              transition: 'width .4s linear',
             },
-          }, src
-            ? h('img', { src, alt: '相框', style: { maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', display: 'block' } })
-            : h('div', { style: { fontSize: 13, color: T.text3 } }, '还没有图片')),
-          h('div', { key: 'a', style: { display: 'flex', gap: 14, alignItems: 'center', marginTop: 12, flex: 'none' } }, [
-            h('label', { key: 'u', style: { ...S.btn, cursor: 'pointer' } }, [
-              busy ? '处理中…' : '上传',
-              h('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp', onChange: onPick, style: { display: 'none' } }),
-            ]),
-            src ? h('button', { key: 'd', type: 'button', style: S.btn, onClick: onRemove }, '移除') : null,
-            err ? h('span', { key: 'e', style: { ...S.dim, color: '#ff453a' } }, err) : null,
+          })),
+          h('div', { key: 'a', style: { display: 'flex', gap: 16, alignItems: 'center', marginTop: 12, flex: 'none' } }, [
+            link(st.phase === 'paused' ? '继续' : '暂停', () => post(st.phase === 'paused' ? 'resume' : 'pause')),
+            link('取消', () => post('cancel')),
+            st.phase === 'paused'
+              ? h('span', { key: 'p', style: { ...S.dim } }, '已暂停')
+              : null,
           ]),
+          err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null,
         ]);
       }
 
@@ -1388,7 +1478,8 @@ if (!window.__lifehudClientRegistered) {
                   h('span', { key: 'a', style: { ...S.dim, flex: 'none' } }, relTime(s.at)),
                 ]))));
 
-          const photoCard = h(Card, { key: 'photo', title: '相框' }, h(PhotoBody, null));
+          const countdownCard = h(Card, { key: 'countdown', title: '倒计时' },
+            h(CountdownBody, { initial: data?.countdown ?? null }));
 
           // 体重卡：第一行第 2 格（第一行更高更宽，曲线图读起来更舒服）；
           // 关掉时返回 null，整格不占位（第一行自然回到 2 格）。
@@ -1402,10 +1493,10 @@ if (!window.__lifehudClientRegistered) {
             : null;
 
           // 第一行：天气 + 体重 + 任务
-          // 第二行：专注 + 会话 + 相框 + 热力
+          // 第二行：专注 + 会话 + 倒计时 + 热力
           const rows = h('div', { key: 'rows', className: 'lh-rows' }, [
             h('div', { key: 'r1', className: 'lh-row lh-r1' }, [weatherCard, weightCard, tasksCard]),
-            h('div', { key: 'r2', className: 'lh-row lh-r2' }, [focusCard, sessionsCard, photoCard, heatCard]),
+            h('div', { key: 'r2', className: 'lh-row lh-r2' }, [focusCard, sessionsCard, countdownCard, heatCard]),
           ]);
 
           return h('div', { style: { ...S.page, background: T.bg, ...backgroundStyle(settings) } }, [
