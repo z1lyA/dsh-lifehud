@@ -476,6 +476,12 @@ if (!window.__lifehudClientRegistered) {
       }
 
       /** 逐小时条：从 nowIndex 起连续取 count 个（可跨午夜）。尺寸收紧以适配固定行高。 */
+      /** 时间戳 → `HH:mm`（本机时区），用来把「取数时刻」说清楚。 */
+      function hhmm(ms) {
+        if (!ms) return '';
+        return new Date(ms).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+      }
+
       function HourlyStrip(props) {
         const start = Number.isFinite(props.nowIndex) ? props.nowIndex : new Date().getHours();
         const items = (props.hourly ?? []).slice(start, start + (props.count ?? 8));
@@ -491,8 +497,9 @@ if (!window.__lifehudClientRegistered) {
             background: p.i === start ? 'rgba(255,255,255,0.14)' : 'transparent',
           },
         }, [
+          // 数据陈旧时不要自称「现在」：那一格是取数时刻的预报值，不是实测。
           h('div', { key: 'h', style: { fontSize: 11, opacity: p.i === start ? 0.95 : 0.6, marginBottom: 5, lineHeight: 1.2 } },
-            p.i === start ? '现在' : (p.day !== today ? `次${p.h}时` : `${p.h}时`)),
+            p.i === start && !props.stale ? '现在' : (p.day !== today ? `次${p.h}时` : `${p.h}时`)),
           h('div', { key: 'i', style: { display: 'flex', justifyContent: 'center' } }, h(WeatherIcon, { kind: p.icon, size: 19 })),
           h('div', {
             key: 't',
@@ -1263,13 +1270,18 @@ if (!window.__lifehudClientRegistered) {
           const openChat = () => window.open(settings.chatUrl || 'https://chat.deepseek.com/', '_blank', 'noopener');
 
           /* ---- 卡片 ---- */
-          // 天气卡底部一行状态：断线时明确告诉用户「这是几点的数据」或「现在取不到」。
+          // 天气卡底部一行状态：断线时明确告诉用户「数据是几点的」或「现在取不到」。
           // 数据来自 /hud 的 weatherDiag（Host 旧了就没有这个字段，整行不显示）。
+          // 措辞要点（2026-11-19 用户反馈改）：必须说清是**取数时刻**，
+          // 不能写成「显示的是 4 小时前的数据」——那样会被读成「数据覆盖的是 4 小时前」。
           const weatherDiag = data?.weatherDiag ?? null;
+          const weatherStale = Boolean(weatherDiag?.failed);
           const weatherNote = !weatherDiag ? '' : (() => {
             const at = weatherDiag.cached?.at;
-            if (weather && weatherDiag.failed && at) return `取不到最新的 · 显示的是 ${relTime(at)}的数据`;
-            if (!weather && at) return `现在取不到 · 显示 ${relTime(at)}之前的数据`;
+            if (weather && at) {
+              return weatherStale ? `取不到最新天气 · 数据取于 ${hhmm(at)}（${relTime(at)}）` : '';
+            }
+            if (at) return `取不到最新天气 · 数据取于 ${hhmm(at)}（${relTime(at)}）`;
             if (!weather) return weatherDiag.failed?.at ? `现在取不到 · ${relTime(weatherDiag.failed.at)}试过一次` : '正在获取…';
             return '';
           })();
@@ -1298,6 +1310,7 @@ if (!window.__lifehudClientRegistered) {
                 h('div', { key: 'right', style: { flex: '1 1 380px', minWidth: 0 } },
                   h(HourlyStrip, {
                     key: 'hs', hourly: weather.hourly, nowIndex: weather.nowIndex, count: settings.weatherHours,
+                    stale: weatherStale,
                   })),
               ])
               : h('div', { key: 'e', style: { ...S.empty, color: '#c9def5' } }, '天气取不到'),
