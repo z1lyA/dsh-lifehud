@@ -2,11 +2,10 @@
  * LifeHud — Host half（入口）。
  *
  * Endpoints (all loopback-only):
- *   GET    /lifehud/api/hud       → tasks(current slot) + weather + sessions + focus
+ *   GET    /lifehud/api/hud       → tasks(current slot) + weather + sessions + focus + countdown
  *   GET    /lifehud/api/weight    → weight series (last 7 measured days) + sync state
- *   GET    /lifehud/api/photo     → stored photo bytes
- *   POST   /lifehud/api/photo     → store base64 photo (≤4 MB)
- *   DELETE /lifehud/api/photo     → remove photo
+ *   GET    /lifehud/api/countdown → 倒计时状态（单个，Host 侧计时）
+ *   POST   /lifehud/api/countdown → { action: start|pause|resume|cancel, ms? }
  *   GET    /lifehud/api/settings  → persisted settings (location etc.)
  *   POST   /lifehud/api/settings  → merge settings
  *   GET    /lifehud/api/update    → 检查远端有没有新版本（只读 GitHub，手动触发）
@@ -16,7 +15,7 @@
  *
  * @module dsh-lifehud
  */
-import { readFileSync, readdirSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'node:fs';
+import { readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -25,16 +24,18 @@ import { readWeight, WEIGHT_TTL_MS } from './lib/weight.js';
 import { readUpdate } from './lib/update.js';
 import { importHistory, noteCapture, startCollector } from './lib/capture.js';
 import { mergeSettingsFile, readSettingsFile } from './lib/settings.js';
+import {
+  configureCountdown, countdownStatus, countdownStart, countdownPause,
+  countdownResume, countdownCancel, disposeCountdown,
+} from './lib/countdown.js';
 
 const API_PREFIX = '/lifehud/api';
 const HUD_PATH = `${API_PREFIX}/hud`;
 const WEIGHT_PATH = `${API_PREFIX}/weight`;
-const PHOTO_PATH = `${API_PREFIX}/photo`;
+const COUNTDOWN_PATH = `${API_PREFIX}/countdown`;
 const SETTINGS_PATH = `${API_PREFIX}/settings`;
 const SESSION_EXISTS_PATH = `${API_PREFIX}/session-exists`;
 const UPDATE_PATH = `${API_PREFIX}/update`;
-
-const MAX_PHOTO_BYTES = 4 * 1024 * 1024;
 
 /** @param {import('node:http').ServerResponse} res @param {number} status @param {unknown} payload */
 function sendJson(res, status, payload) {
@@ -51,6 +52,9 @@ function isLocalPeer(req) {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
 }
 
+/** 请求体上限。只剩设置/倒计时这类小 JSON，1 MB 绰绰有余（相册上传已移除）。 */
+const MAX_BODY_BYTES = 1024 * 1024;
+
 /** @param {import('node:http').IncomingMessage} req @returns {Promise<string>} */
 function readTextBody(req) {
   return new Promise((resolve, reject) => {
@@ -58,7 +62,7 @@ function readTextBody(req) {
     let size = 0;
     req.on('data', (chunk) => {
       size += chunk.length;
-      if (size > MAX_PHOTO_BYTES * 2) {
+      if (size > MAX_BODY_BYTES) {
         reject(new Error('request too large'));
         req.destroy();
         return;
@@ -97,8 +101,15 @@ export function apply(ctx, config = {}) {
 function applyInner(ctx, config) {
   const dataDir = String(config.dataDir ?? join(homedir(), '.dsh', 'lifehud'));
   mkdirSync(dataDir, { recursive: true });
-  const photoPath = join(dataDir, 'lifehud-photo.bin');
-  const photoMetaPath = join(dataDir, 'lifehud-photo.json');
+
+  // 倒计时（v1.1.6）：计时器必须活在 Host —— 页面切走/挂后台时组件卸载，
+  // 纯前端计时器会跟着消失，到点不会有任何提醒。这里顺便处理「离开期间到点」的补偿通知。
+  try {
+    configureCountdown({ ...config, dataDir });
+    ctx.effect(() => () => disposeCountdown(), 'lifehud: countdown');
+  } catch (error) {
+    try { ctx.logger?.warn?.(`[lifehud] countdown not ready: ${error instanceof Error ? error.message : String(error)}`); } catch { /* ignore */ }
+  }
 
   const isRunning = (sessionId) => {
     try {
@@ -160,48 +171,33 @@ function applyInner(ctx, config) {
 
   ctx.inject(['webServer'], (web) => {
     web.effect(() => {
-      const photoHandler = async (req, res) => {
+      const countdownHandler = async (req, res) => {
         if (!isLocalPeer(req)) {
           sendJson(res, 403, { ok: false, error: 'local access only' });
           return;
         }
         if (req.method === 'GET') {
-          if (!existsSync(photoPath) || !existsSync(photoMetaPath)) {
-            sendJson(res, 404, { ok: false, error: 'no photo' });
-            return;
-          }
-          let type = 'image/jpeg';
-          try {
-            type = String(JSON.parse(readFileSync(photoMetaPath, 'utf8')).type ?? 'image/jpeg');
-          } catch { /* jpeg */ }
-          res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' });
-          res.end(readFileSync(photoPath));
+          sendJson(res, 200, { ok: true, countdown: countdownStatus() });
           return;
         }
-        if (req.method === 'DELETE') {
-          try { unlinkSync(photoPath); } catch { /* gone */ }
-          try { unlinkSync(photoMetaPath); } catch { /* gone */ }
-          sendJson(res, 200, { ok: true });
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: 'GET/POST only' });
           return;
         }
-        if (req.method === 'POST') {
-          try {
-            const text = await readTextBody(req);
-            const parsed = JSON.parse(text);
-            const data = String(parsed?.data ?? '');
-            const match = data.match(/^data:(image\/(?:png|jpeg|webp));base64,([\s\S]+)$/);
-            if (!match) throw new Error('expected data:image/(png|jpeg|webp);base64,…');
-            const bytes = Buffer.from(match[2], 'base64');
-            if (bytes.length > MAX_PHOTO_BYTES) throw new Error('photo too large (4 MB max)');
-            writeFileSync(photoPath, bytes);
-            writeFileSync(photoMetaPath, JSON.stringify({ type: match[1] }));
-            sendJson(res, 200, { ok: true, bytes: bytes.length });
-          } catch (error) {
-            sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
-          }
-          return;
+        try {
+          const text = await readTextBody(req);
+          const body = text ? JSON.parse(text) : {};
+          const action = String(body.action ?? '');
+          let next;
+          if (action === 'start') next = countdownStart(Number(body.ms));
+          else if (action === 'pause') next = countdownPause();
+          else if (action === 'resume') next = countdownResume();
+          else if (action === 'cancel') next = countdownCancel();
+          else throw new Error('action 必须是 start / pause / resume / cancel');
+          sendJson(res, 200, { ok: true, countdown: next });
+        } catch (error) {
+          sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
         }
-        sendJson(res, 405, { ok: false, error: 'GET/POST/DELETE only' });
       };
 
       const settingsHandler = async (req, res) => {
@@ -238,7 +234,9 @@ function applyInner(ctx, config) {
           return;
         }
         buildHud(config, { isRunning })
-          .then((payload) => sendJson(res, 200, payload))
+          // 倒计时随 /hud 一起下发（页面开着时卡片能立刻拿到权威状态）；
+          // 它自己的增删改走 POST /lifehud/api/countdown。
+          .then((payload) => sendJson(res, 200, { ...payload, countdown: countdownStatus() }))
           .catch((error) => sendJson(res, 500, {
             ok: false,
             error: 'hud build failed',
@@ -287,7 +285,7 @@ function applyInner(ctx, config) {
       };
 
       const d1 = web.webServer.register({ kind: 'exact', path: HUD_PATH, handler: hudHandler });
-      const d2 = web.webServer.register({ kind: 'exact', path: PHOTO_PATH, handler: photoHandler });
+      const d2 = web.webServer.register({ kind: 'exact', path: COUNTDOWN_PATH, handler: countdownHandler });
       const d3 = web.webServer.register({ kind: 'exact', path: SETTINGS_PATH, handler: settingsHandler });
       const d5 = web.webServer.register({ kind: 'exact', path: WEIGHT_PATH, handler: weightHandler });
       const d6 = web.webServer.register({ kind: 'exact', path: UPDATE_PATH, handler: updateHandler });
@@ -352,6 +350,11 @@ function applyInner(ctx, config) {
 export { readOwnActivity } from './lib/activity.js';
 export { openCaptureDb, appendSample, flushCapture, captureStatus, startCollector, importHistory } from './lib/capture.js';
 export { readWeight } from './lib/weight.js';
+export {
+  configureCountdown, countdownStatus, countdownStart, countdownPause, countdownResume,
+  countdownCancel, disposeCountdown, setCountdownNotifier, shiftCountdownForTest,
+  tickCountdownForTest, resetCountdownForTest, COUNTDOWN_MAX_MS,
+} from './lib/countdown.js';
 export { buildHud, readWeather, clearWeatherCache, weatherStatus } from './lib/hud.js';
 export {
   parseVersion, compareVersion, summarizeUpdate, readUpdate, UPDATE_REASON_CODES,
