@@ -1044,6 +1044,30 @@ if (!window.__lifehudClientRegistered) {
           return () => clearInterval(t);
         }, [st.phase]);
 
+        // 走到 0 时主动问一次 Host：状态以 Host 为准。
+        // 少了这段，卡片会停在「运行中 00:00」直到下一次 `/hud`（最多 5 分钟）或你切走再回来
+        // ——2026-11-19 用户实测就是这个现象。重试若干次覆盖 Host 那 1 秒的 tick 间隔。
+        React.useEffect(() => {
+          if (st.phase !== 'running') return undefined;
+          if ((st.endsAt || 0) - Date.now() > 0) return undefined;
+          let alive = true;
+          let tries = 0;
+          const pull = async () => {
+            tries += 1;
+            try {
+              const res = await fetch(COUNTDOWN_URL, { cache: 'no-store' });
+              const payload = await res.json();
+              if (!alive || !payload?.countdown) return;
+              setSt(payload.countdown);
+              if (payload.countdown.phase !== 'running') clearInterval(timer);
+            } catch { /* 抖动就下一轮再试 */ }
+            if (tries >= 12) clearInterval(timer);
+          };
+          const timer = setInterval(pull, 700);
+          pull();
+          return () => { alive = false; clearInterval(timer); };
+        }, [st.phase, st.endsAt, now]);
+
         const post = async (action, ms) => {
           setBusy(true); setErr(null);
           try {
@@ -1090,9 +1114,10 @@ if (!window.__lifehudClientRegistered) {
             },
           }, text);
         };
-        const primary = (label, onClick, disabled) => h('button', {
+        const primary = (label, onClick, disabled, title) => h('button', {
           type: 'button',
           onClick,
+          title,
           disabled: disabled || busy,
           style: {
             fontSize: 12.5, fontWeight: 600, border: 'none', borderRadius: 980, padding: '7px 18px',
@@ -1136,7 +1161,7 @@ if (!window.__lifehudClientRegistered) {
               key: 'foot',
               style: { display: 'flex', alignItems: 'center', gap: 14, marginTop: 10, flex: 'none' },
             }, [
-              primary('开始', () => post('start', totalMs), totalMs <= 0),
+              primary('开始', () => post('start', totalMs), totalMs <= 0, totalMs <= 0 ? '先用滚轮拨一个时长' : undefined),
               ghost('收起', () => setCustom(false)),
             ]),
             errLine,
@@ -1173,7 +1198,8 @@ if (!window.__lifehudClientRegistered) {
                 title: '到点会弹 Windows 系统通知；单次最多 24 小时',
                 style: { fontSize: 11.5, color: T.text2, whiteSpace: 'nowrap' },
               }, '最多 24 小时'),
-              ghost('自定义…', () => setCustom((v) => !v)),
+              // 每次进自定义都从 00:00:00 起（不沿用上一次的设定，2026-11-19 用户要求）
+              ghost('自定义…', () => { setHh(0); setMm(0); setSs(0); setCustom(true); }),
             ]),
             errLine,
           ]);
@@ -1190,8 +1216,11 @@ if (!window.__lifehudClientRegistered) {
               bigNumber('00:00', '#ff453a'),
               h('div', { key: 't', style: { fontSize: 11.5, color: T.text2, marginTop: 8 } }, `${hhmm(st.finishedAt)} 结束`),
             ]),
-            h('div', { key: 'act', style: { display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 } },
-              primary('再来一次', () => post('start', st.totalMs))),
+            h('div', { key: 'act', style: { display: 'flex', alignItems: 'center', gap: 14, marginTop: 10 } }, [
+              primary('再来一次', () => post('start', st.totalMs)),
+              // 结束后也要能回到「重新设一段」，否则只剩再来一次这一条路
+              ghost('重新设置', () => post('cancel')),
+            ]),
             errLine,
           ]);
         }
