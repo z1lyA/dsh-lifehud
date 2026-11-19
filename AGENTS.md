@@ -222,7 +222,16 @@ Client  ──POST /lifehud/api/countdown {action, ms}──►  lib/countdown.j
 - **"离开期间到点"补偿**：`configureCountdown()`（Host 启动时调一次）发现 `running` 且 `endsAt` 已过 →
   置 `done` 并发一条「…在你离开时到点了（HH:mm）」，然后停在 00:00 等用户处理。
 - **前端只做两件事**：本地每秒重绘剩余时间（`endsAt - now`）、按钮点按 POST。真实状态永远以 Host 为准。
-- **改它**：`lib/countdown.js`（状态机/落盘/通知）、`index.js`（路由与 `/hud` 注入）、`client.js` 的 `CountdownBody`。
+- **视觉规格（2026-11-19 用户嫌"排版一般"后重做，别退回去）**：
+  1. **数字是唯一主角**：`MM:SS` 52px / `H:MM:SS` 44px（按位数自适应，窄格不顶边）、`tabular-nums`、`letter-spacing:-0.035em`；
+  2. 上方一枚 **11px 状态徽标**（运行中 / 已暂停 / 已结束），字距 0.14em、opacity .5——只做层级标签，不做标题；
+  3. **进度是 3px 贴边细线**（不是居中的粗条），不抢数字；
+  4. **主操作实心胶囊**（暂停 / 继续 / 开始 / 再来一次），「取消 / 自定义」退成文字链接（`.lh-cd-link`，opacity .55）；
+  5. **待设置态 2×2 键帽**（`.lh-cd-grid` + `grid-auto-rows:1fr` 铺满高度，`.lh-cd-key` 有 hover/按压缩放），底部一行「最多 24 小时 + 自定义…」；
+  6. **数字块垂直居中**（`.lh-cd-stage`），卡片变高时不再顶在上沿；
+  7. 已结束：`00:00` 用错误红 `#ff453a` + 一次 `.lh-cd-pop` 脉冲（0.7s × 2）。
+  验证方式：把五态写成静态 HTML，用 **Edge 无头截图**（`--headless=new --force-device-scale-factor=2`）看真实渲染，覆盖 264/300/330 宽与 220/290 高、`1:25:00` 长字符串。
+- **改它**：`lib/countdown.js`（状态机/落盘/通知）、`index.js`（路由与 `/hud` 注入）、`client.js` 的 `CountdownBody` + CSS（`.lh-cd-*`）。
 - **验证**：`node spike/probe-countdown.mjs`（31 项）。真通知链路另外手工验过一次：
   2 秒倒计时 → 系统通知库里出现两条 `倒计时结束`（`wpndatabase.db`，**入库有 1–3 秒延迟**）。
 

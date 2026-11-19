@@ -402,6 +402,26 @@ if (!window.__lifehudClientRegistered) {
         // 热力格子铺满卡片：行高等分，格子随卡片变大（不再只堆在顶部）
         '.lh-heat{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));grid-auto-rows:minmax(0,1fr);gap:5px;height:100%}',
         '.lh-heat-cell{border-radius:6px;background:currentColor;min-height:6px}',
+        // 倒计时卡：键帽（预设按钮）的手感 + 到点那一下的轻微脉冲
+        '@keyframes lifehud-cd-pop{0%{transform:scale(1)}45%{transform:scale(1.035)}100%{transform:scale(1)}}',
+        '.lh-cd-key{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;',
+        'border:none;border-radius:14px;background:rgba(128,128,128,.13);color:currentColor;cursor:pointer;',
+        'padding:12px 0;transition:background .15s ease,transform .12s ease}',
+        '.lh-cd-key:hover{background:rgba(128,128,128,.22)}',
+        '.lh-cd-key:active{transform:scale(.96)}',
+        '.lh-cd-key:disabled{opacity:.45;cursor:default}',
+        '.lh-cd-key strong{font-size:22px;font-weight:600;line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}',
+        '.lh-cd-key span{font-size:11px;opacity:.55;letter-spacing:.02em}',
+        '.lh-cd-link{border:none;background:none;color:currentColor;opacity:.55;font-size:12px;cursor:pointer;padding:2px 0;transition:opacity .15s ease}',
+        '.lh-cd-link:hover{opacity:.9}',
+        '.lh-cd-link:disabled{opacity:.3;cursor:default}',
+        '.lh-cd-pop{animation:lifehud-cd-pop .7s ease-out 2}',
+        // 预设键帽铺满可用高度（否则卡片高时中间会空一大块）
+        '.lh-cd-grid{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:minmax(0,1fr);gap:10px}',
+        // 展开自定义时把键帽压扁，把空间让给选择器与「开始」（否则控件被挤成二等内容）
+        '.lh-cd-grid.compact{flex:0 0 auto;grid-auto-rows:56px}',
+        // 数字块在剩余空间里垂直居中（卡片高时不再顶在上沿）
+        '.lh-cd-stage{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;justify-content:center}',
         '@media (max-width:900px){',
         '.lh-row{flex-wrap:wrap;max-height:none;gap:16px}',
         '.lh-cell,.lh-cell-wide{flex:1 1 45%}',
@@ -981,90 +1001,138 @@ if (!window.__lifehudClientRegistered) {
           ? Math.max(0, (st.endsAt || 0) - now)
           : Math.max(0, st.remainingMs || 0);
         const pct = st.totalMs > 0 ? Math.max(0, Math.min(100, (remaining / st.totalMs) * 100)) : 0;
-        const link = (label, onClick) => h('button', {
-          type: 'button', style: { ...S.btn, textDecoration: 'underline' }, onClick, disabled: busy,
+        /**
+         * 视觉主角是那个大数字，其余元素都给它让路：
+         *   - 状态徽标（运行中 / 已暂停 / 已结束）11px + 拉宽字距，只做层级标签，不当标题；
+         *   - 进度是一条贴边细线，不抢数字；
+         *   - 主操作实心胶囊，「取消」这类次级动作退成文字链接。
+         */
+        const badge = (text) => h('span', {
+          key: 'b',
+          style: { fontSize: 11, letterSpacing: '0.14em', opacity: 0.5, textTransform: 'uppercase' },
+        }, text);
+        const bigNumber = (text, color) => {
+          // 52px 是「MM:SS」的尺寸；`H:MM:SS` 会顶到卡边，按位数收一档。
+          const len = String(text).length;
+          const size = len >= 8 ? 38 : len >= 6 ? 44 : 52;
+          return h('div', {
+            key: 'n',
+            style: {
+              fontSize: size, fontWeight: 600, lineHeight: 1, letterSpacing: '-0.035em',
+              fontVariantNumeric: 'tabular-nums', marginTop: 8, color: color ?? T.text,
+              whiteSpace: 'nowrap',
+            },
+          }, text);
+        };
+        const primary = (label, onClick, disabled) => h('button', {
+          type: 'button',
+          onClick,
+          disabled: disabled || busy,
+          style: {
+            fontSize: 12.5, fontWeight: 600, border: 'none', borderRadius: 980, padding: '7px 18px',
+            cursor: disabled || busy ? 'default' : 'pointer',
+            background: T.text, color: T.bg, opacity: disabled || busy ? 0.5 : 1,
+          },
         }, label);
+        const ghost = (label, onClick) => h('button', {
+          key: label, type: 'button', className: 'lh-cd-link', onClick, disabled: busy,
+        }, label);
+        // 进度线：读「已经用掉多少」而不是「还剩多少」——后者越走越短，容易被当成
+        // 数字下面的下划线（2026-11-19 独立评审实测反馈）。剩余量由大数字负责。
+        const bar = h('div', {
+          key: 'bar',
+          title: `已用 ${Math.round(100 - pct)}%`,
+          style: { height: 3, borderRadius: 2, background: 'rgba(128,128,128,0.18)', marginTop: 16, overflow: 'hidden' },
+        }, h('div', {
+          style: {
+            width: `${Math.max(0, Math.min(100, 100 - pct))}%`, height: '100%', borderRadius: 2,
+            background: T.text2, transition: 'width .4s linear',
+          },
+        }));
+        const errLine = err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null;
 
-        // 待设置：预设在前，自定义折叠在后
+        // 待设置：2×2 键帽（数字大、单位小），自定义收在右下角
         if (st.phase === 'idle') {
           const totalMs = ((hh * 3600 + mm * 60 + ss) * 1000);
-          return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } }, [
-            h('div', { key: 'hint', style: { fontSize: 12.5, color: T.text3, marginBottom: 10 } },
-              '设一段时长，到点弹系统通知（最多 24 小时）'),
-            h('div', { key: 'p', style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
-              PRESETS.map((v) => h('button', {
-                key: v,
-                type: 'button',
-                disabled: busy,
-                onClick: () => post('start', v * 60000),
-                style: {
-                  fontSize: 12.5, color: T.text2, background: 'rgba(128,128,128,0.16)',
-                  border: 'none', borderRadius: 980, padding: '5px 12px', cursor: 'pointer',
-                },
-              }, `${v} 分钟`))),
-            h('div', { key: 'c', style: { marginTop: 10, flex: 'none' } },
-              link(custom ? '收起自定义' : '自定义…', () => setCustom((v) => !v))),
-            custom ? h('div', { key: 'cf', style: { display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' } }, [
-              numSelect(hh, 23, setHh, '时'),
-              numSelect(mm, 59, setMm, '分'),
-              numSelect(ss, 59, setSs, '秒'),
-              h('button', {
-                key: 'go',
-                type: 'button',
-                disabled: busy || totalMs <= 0,
-                onClick: () => post('start', totalMs),
-                style: {
-                  fontSize: 12.5, color: '#000', background: T.text, border: 'none',
-                  borderRadius: 980, padding: '5px 14px', cursor: 'pointer',
-                },
-              }, '开始'),
-            ]) : null,
-            err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null,
-          ]);
-        }
-
-        // 已结束：停在 00:00，附「X 点结束 · 再来一次」
-        if (st.phase === 'done') {
-          return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'center' } }, [
+          return h('div', {
+            style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'space-between' },
+          }, [
             h('div', {
-              key: 'n',
-              style: { fontSize: 40, fontWeight: 600, lineHeight: 1, letterSpacing: '-0.03em', color: '#ff453a', fontVariantNumeric: 'tabular-nums' },
-            }, '00:00'),
-            h('div', { key: 't', style: { marginTop: 10, fontSize: 12.5, color: T.text3 } },
-              h('button', {
-                key: 'r',
-                type: 'button',
-                disabled: busy,
-                onClick: () => post('start', st.totalMs),
-                style: { ...S.btn, textDecoration: 'underline' },
-              }, `${hhmm(st.finishedAt)} 结束 · 再来一次`)),
-            err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null,
+              key: 'top',
+              style: { flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' },
+            }, [
+              h('div', { key: 'p', className: `lh-cd-grid${custom ? ' compact' : ''}` },
+                PRESETS.map((v) => h('button', {
+                  key: v,
+                  type: 'button',
+                  className: 'lh-cd-key',
+                  disabled: busy,
+                  onClick: () => post('start', v * 60000),
+                }, [
+                  h('strong', { key: 'n' }, String(v)),
+                  h('span', { key: 'u' }, '分钟'),
+                ]))),
+              custom ? h('div', {
+                key: 'cf',
+                style: {
+                  flex: '1 1 auto', minHeight: 0, display: 'flex', alignItems: 'center',
+                  justifyContent: 'center', gap: 10, marginTop: 12, flexWrap: 'wrap',
+                },
+              }, [
+                numSelect(hh, 23, setHh, '时'),
+                numSelect(mm, 59, setMm, '分'),
+                numSelect(ss, 59, setSs, '秒'),
+              ]) : null,
+            ]),
+            h('div', {
+              key: 'foot',
+              style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 10, flex: 'none' },
+            }, [
+              custom
+                ? primary('开始', () => post('start', totalMs), totalMs <= 0)
+                : h('span', {
+                  key: 'hint',
+                  title: '到点会弹 Windows 系统通知；单次最多 24 小时',
+                  style: { fontSize: 11.5, color: T.text2, whiteSpace: 'nowrap' },
+                }, '最多 24 小时'),
+              ghost(custom ? '收起' : '自定义…', () => setCustom((v) => !v)),
+            ]),
+            errLine,
           ]);
         }
 
-        // 跑着 / 暂停：大数字 + 细进度条 + 暂停·继续 / 取消
-        return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'center' } }, [
-          h('div', {
-            key: 'n',
-            style: { fontSize: 40, fontWeight: 600, lineHeight: 1, letterSpacing: '-0.03em', fontVariantNumeric: 'tabular-nums' },
-          }, fmtCountdown(remaining)),
-          h('div', {
-            key: 'bar',
-            style: { height: 4, borderRadius: 2, background: 'rgba(128,128,128,0.22)', marginTop: 12, overflow: 'hidden' },
-          }, h('div', {
-            style: {
-              width: `${pct}%`, height: '100%', borderRadius: 2, background: T.text2,
-              transition: 'width .4s linear',
-            },
-          })),
-          h('div', { key: 'a', style: { display: 'flex', gap: 16, alignItems: 'center', marginTop: 12, flex: 'none' } }, [
-            link(st.phase === 'paused' ? '继续' : '暂停', () => post(st.phase === 'paused' ? 'resume' : 'pause')),
-            link('取消', () => post('cancel')),
-            st.phase === 'paused'
-              ? h('span', { key: 'p', style: { ...S.dim } }, '已暂停')
-              : null,
+        // 已结束：00:00 变红 + 一次轻微脉冲，主操作是「再来一次」
+        if (st.phase === 'done') {
+          return h('div', {
+            className: 'lh-cd-pop',
+            style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'space-between' },
+          }, [
+            h('div', { key: 'top', className: 'lh-cd-stage' }, [
+              badge('已结束'),
+              bigNumber('00:00', '#ff453a'),
+              h('div', { key: 't', style: { fontSize: 11.5, color: T.text2, marginTop: 8 } }, `${hhmm(st.finishedAt)} 结束`),
+            ]),
+            h('div', { key: 'act', style: { display: 'flex', alignItems: 'center', gap: 12, marginTop: 10 } },
+              primary('再来一次', () => post('start', st.totalMs))),
+            errLine,
+          ]);
+        }
+
+        // 跑着 / 暂停：大数字 + 贴边细进度线 + 暂停·继续（主）/ 取消（次）
+        const paused = st.phase === 'paused';
+        return h('div', {
+          style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'space-between' },
+        }, [
+          h('div', { key: 'top', className: 'lh-cd-stage' }, [
+            badge(paused ? '已暂停' : '运行中'),
+            bigNumber(fmtCountdown(remaining), T.text),
+            bar,
           ]),
-          err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null,
+          h('div', { key: 'act', style: { display: 'flex', alignItems: 'center', gap: 14, marginTop: 10 } }, [
+            primary(paused ? '继续' : '暂停', () => post(paused ? 'resume' : 'pause')),
+            ghost('取消', () => post('cancel')),
+          ]),
+          errLine,
         ]);
       }
 
