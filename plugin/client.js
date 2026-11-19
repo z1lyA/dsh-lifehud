@@ -418,8 +418,6 @@ if (!window.__lifehudClientRegistered) {
         '.lh-cd-pop{animation:lifehud-cd-pop .7s ease-out 2}',
         // 预设键帽铺满可用高度（否则卡片高时中间会空一大块）
         '.lh-cd-grid{flex:1 1 auto;min-height:0;display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:minmax(0,1fr);gap:10px}',
-        // 展开自定义时把键帽压扁，把空间让给选择器与「开始」（否则控件被挤成二等内容）
-        '.lh-cd-grid.compact{flex:0 0 auto;grid-auto-rows:56px}',
         // 数字块在剩余空间里垂直居中（卡片高时不再顶在上沿）
         '.lh-cd-stage{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;justify-content:center}',
         '@media (max-width:900px){',
@@ -939,18 +937,86 @@ if (!window.__lifehudClientRegistered) {
         return hh > 0 ? `${hh}:${mm}:${ss}` : `${mm}:${ss}`;
       }
 
-      /** 时/分/秒三段选择器里的一段。 */
-      function numSelect(value, max, onChange, unit) {
-        return h('label', { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: T.text3 } }, [
-          h('select', {
-            value,
-            onChange: (event) => onChange(Number(event.target.value)),
-            style: {
-              fontSize: 12.5, color: T.text, background: '#2c2c2e', border: 'none',
-              borderRadius: 8, padding: '4px 6px', cursor: 'pointer',
-            },
-          }, Array.from({ length: max + 1 }, (_, v) => h('option', { key: v, value: v }, String(v).padStart(2, '0')))),
-          unit,
+      /**
+       * 滚轮列：中间是当前值，上下各露一个相邻值（绕圈：23 的上一个是 00）。
+       * 鼠标滚轮 / 点上下那一行 / ↑↓ 方向键都能改。
+       *
+       * 为什么不用 `<select>`：原生 select 的滚轮只在展开面板里生效，而展开面板会盖住卡片；
+       * 要「鼠标悬停就能滚」只能自己接 wheel。接 wheel 又必须用**原生**监听并 `passive:false`——
+       * React 合成事件的 wheel 是 passive 的，`preventDefault()` 拦不住页面滚动。
+       */
+      function WheelColumn(props) {
+        const { value, max, unit, disabled } = props;
+        const ref = React.useRef(null);
+        // 用 ref 存最新回调，避免父组件每次渲染都重建监听
+        const cb = React.useRef(props.onChange);
+        cb.current = props.onChange;
+        const wrap = (v) => ((v % (max + 1)) + (max + 1)) % (max + 1);
+
+        React.useEffect(() => {
+          const el = ref.current;
+          if (!el) return undefined;
+          let last = 0;
+          const onWheel = (event) => {
+            event.preventDefault();
+            if (disabled) return;
+            const t = Date.now();
+            if (t - last < 70) return; // 触控板会连发 wheel，限流免得一次跳过好几格
+            last = t;
+            cb.current(wrap(value + (event.deltaY < 0 ? 1 : -1)));
+          };
+          el.addEventListener('wheel', onWheel, { passive: false });
+          return () => el.removeEventListener('wheel', onWheel);
+        }, [value, max, disabled]);
+
+        const row = (v, isCurrent) => h('div', {
+          key: isCurrent ? 'cur' : `o${v}`,
+          onClick: isCurrent || disabled ? undefined : () => cb.current(v),
+          style: {
+            height: 32, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            borderRadius: 12,
+            // 当前值坐一条浅色“窗口”，一眼看出哪一格在中间
+            background: isCurrent ? 'rgba(128,128,128,0.14)' : 'transparent',
+            fontSize: isCurrent ? 30 : 13,
+            fontWeight: isCurrent ? 600 : 400,
+            opacity: isCurrent ? 1 : 0.3,
+            cursor: isCurrent || disabled ? 'default' : 'pointer',
+            fontVariantNumeric: 'tabular-nums', letterSpacing: '-0.02em', userSelect: 'none',
+          },
+        }, String(v).padStart(2, '0'));
+
+        return h('div', {
+          ref,
+          tabIndex: 0,
+          role: 'spinbutton',
+          'aria-label': unit,
+          'aria-valuenow': value,
+          'aria-valuemin': 0,
+          'aria-valuemax': max,
+          onKeyDown: (event) => {
+            if (disabled) return;
+            if (event.key === 'ArrowUp' || event.key === 'ArrowRight') {
+              event.preventDefault();
+              cb.current(wrap(value + 1));
+            } else if (event.key === 'ArrowDown' || event.key === 'ArrowLeft') {
+              event.preventDefault();
+              cb.current(wrap(value - 1));
+            }
+          },
+          style: {
+            flex: '1 1 0', minWidth: 0, display: 'flex', flexDirection: 'column',
+            alignItems: 'stretch', justifyContent: 'center',
+            outline: 'none', borderRadius: 12,
+            cursor: disabled ? 'default' : 'ns-resize',
+          },
+        }, [
+          row(wrap(value + 1), false),
+          row(value, true),
+          row(wrap(value - 1), false),
+          h('div', {
+            key: 'u',
+            style: { textAlign: 'center', fontSize: 11, opacity: 0.45, marginTop: 2, letterSpacing: '.02em' },
+          }, unit),
         ]);
       }
 
@@ -1051,9 +1117,34 @@ if (!window.__lifehudClientRegistered) {
         }));
         const errLine = err ? h('div', { key: 'e', style: { ...S.dim, color: '#ff453a', marginTop: 8 } }, err) : null;
 
+        // 待设置·自定义：预设整块收起来 —— 已经选了自定义，再摆四个按钮就是多余，
+        // 而且挤在一格里两边都变弱（2026-11-19 用户反馈）。这里只留三个滚轮 + 开始。
+        if (st.phase === 'idle' && custom) {
+          const totalMs = ((hh * 3600 + mm * 60 + ss) * 1000);
+          return h('div', {
+            style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+          }, [
+            h('div', {
+              key: 'w',
+              style: { flex: '1 1 auto', minHeight: 0, display: 'flex', gap: 6, alignItems: 'center' },
+            }, [
+              h(WheelColumn, { key: 'h', value: hh, max: 23, unit: '时', disabled: busy, onChange: setHh }),
+              h(WheelColumn, { key: 'm', value: mm, max: 59, unit: '分', disabled: busy, onChange: setMm }),
+              h(WheelColumn, { key: 's', value: ss, max: 59, unit: '秒', disabled: busy, onChange: setSs }),
+            ]),
+            h('div', {
+              key: 'foot',
+              style: { display: 'flex', alignItems: 'center', gap: 14, marginTop: 10, flex: 'none' },
+            }, [
+              primary('开始', () => post('start', totalMs), totalMs <= 0),
+              ghost('收起', () => setCustom(false)),
+            ]),
+            errLine,
+          ]);
+        }
+
         // 待设置：2×2 键帽（数字大、单位小），自定义收在右下角
         if (st.phase === 'idle') {
-          const totalMs = ((hh * 3600 + mm * 60 + ss) * 1000);
           return h('div', {
             style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, justifyContent: 'space-between' },
           }, [
@@ -1061,7 +1152,7 @@ if (!window.__lifehudClientRegistered) {
               key: 'top',
               style: { flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' },
             }, [
-              h('div', { key: 'p', className: `lh-cd-grid${custom ? ' compact' : ''}` },
+              h('div', { key: 'p', className: 'lh-cd-grid' },
                 PRESETS.map((v) => h('button', {
                   key: v,
                   type: 'button',
@@ -1072,30 +1163,17 @@ if (!window.__lifehudClientRegistered) {
                   h('strong', { key: 'n' }, String(v)),
                   h('span', { key: 'u' }, '分钟'),
                 ]))),
-              custom ? h('div', {
-                key: 'cf',
-                style: {
-                  flex: '1 1 auto', minHeight: 0, display: 'flex', alignItems: 'center',
-                  justifyContent: 'center', gap: 10, marginTop: 12, flexWrap: 'wrap',
-                },
-              }, [
-                numSelect(hh, 23, setHh, '时'),
-                numSelect(mm, 59, setMm, '分'),
-                numSelect(ss, 59, setSs, '秒'),
-              ]) : null,
             ]),
             h('div', {
               key: 'foot',
               style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, marginTop: 10, flex: 'none' },
             }, [
-              custom
-                ? primary('开始', () => post('start', totalMs), totalMs <= 0)
-                : h('span', {
-                  key: 'hint',
-                  title: '到点会弹 Windows 系统通知；单次最多 24 小时',
-                  style: { fontSize: 11.5, color: T.text2, whiteSpace: 'nowrap' },
-                }, '最多 24 小时'),
-              ghost(custom ? '收起' : '自定义…', () => setCustom((v) => !v)),
+              h('span', {
+                key: 'hint',
+                title: '到点会弹 Windows 系统通知；单次最多 24 小时',
+                style: { fontSize: 11.5, color: T.text2, whiteSpace: 'nowrap' },
+              }, '最多 24 小时'),
+              ghost('自定义…', () => setCustom((v) => !v)),
             ]),
             errLine,
           ]);

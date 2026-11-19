@@ -228,6 +228,9 @@ Client  ──POST /lifehud/api/countdown {action, ms}──►  lib/countdown.j
   3. **进度是 3px 贴边细线**（不是居中的粗条），不抢数字；
   4. **主操作实心胶囊**（暂停 / 继续 / 开始 / 再来一次），「取消 / 自定义」退成文字链接（`.lh-cd-link`，opacity .55）；
   5. **待设置态 2×2 键帽**（`.lh-cd-grid` + `grid-auto-rows:1fr` 铺满高度，`.lh-cd-key` 有 hover/按压缩放），底部一行「最多 24 小时 + 自定义…」；
+  5b. **进「自定义」后预设整块消失**，换成三列**滚轮**（`WheelColumn`：中间当前值坐一条 `rgba(128,128,128,.14)` 高亮带、上下各露一个相邻值并绕圈）；
+  鼠标滚轮 / 点上下那一行 / ↑↓ 方向键都能改。滚轮监听必须用**原生** `addEventListener('wheel', …, { passive: false })`——
+  React 合成事件的 wheel 是 passive 的，`preventDefault()` 拦不住页面滚动；触控板连发 wheel，所以带 70ms 限流；
   6. **数字块垂直居中**（`.lh-cd-stage`），卡片变高时不再顶在上沿；
   7. 已结束：`00:00` 用错误红 `#ff453a` + 一次 `.lh-cd-pop` 脉冲（0.7s × 2）。
   验证方式：把五态写成静态 HTML，用 **Edge 无头截图**（`--headless=new --force-device-scale-factor=2`）看真实渲染，覆盖 264/300/330 宽与 220/290 高、`1:25:00` 长字符串。
