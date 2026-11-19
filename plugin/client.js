@@ -24,7 +24,7 @@ if (!window.__lifehudClientRegistered) {
       const PANEL_ID = 'lifehud';
       const NS = 'lifehud';
       /** 客户端构建标记：改这里 → 页面上能一眼看出加载的是哪一版。 */
-      const BUILD = '1.1.6';
+      const BUILD = '1.1.7';
       const HUD_URL = '/lifehud/api/hud';
       const WEIGHT_URL = '/lifehud/api/weight';
       const SETTINGS_URL = '/lifehud/api/settings';
@@ -1219,7 +1219,7 @@ if (!window.__lifehudClientRegistered) {
             h('div', { key: 'act', style: { display: 'flex', alignItems: 'center', gap: 14, marginTop: 10 } }, [
               primary('再来一次', () => post('start', st.totalMs)),
               // 结束后也要能回到「重新设一段」，否则只剩再来一次这一条路
-              ghost('重新设置', () => post('cancel')),
+              ghost('完成', () => post('cancel')),
             ]),
             errLine,
           ]);
