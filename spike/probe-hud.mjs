@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { buildHud, openCaptureDb, readOwnActivity, readWeather, clearWeatherCache, weatherStatus } from '../plugin/index.js';
+import { buildHud, openCaptureDb, readOwnActivity, readWeather, clearWeatherCache, weatherStatus, setWeatherRetryDelayForTest } from '../plugin/index.js';
 import { NOWTREE_DB, NOWTREE_LEVELDB } from './paths.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -453,6 +453,59 @@ try {
       const clientSrc = readFileSync(join(REPO, 'plugin', 'client.js'), 'utf8');
       check('页面「刷新」走 force（reload(true) + ?force=1）',
         /reload\(true\)/.test(clientSrc) && /`\$\{HUD_URL\}\?force=1`/.test(clientSrc));
+
+      // 10) v1.1.9：失败后**只在后台补一次**。
+      //     真机场景：机器睡醒 / DSH 刚重启时第一次外网连接是冷的，5s 超时被砍，
+      //     卡片落到几小时前的预报，要等下一次页面请求才重试（最多 5 分钟）。
+      setWeatherRetryDelayForTest(30);
+      clearWeatherCache();
+      calls = 0;
+      let failOnce = true;
+      globalThis.fetch = async () => {
+        calls += 1;
+        if (failOnce) { failOnce = false; throw new TypeError('stub: 冷启动超时'); }
+        return okResponse();
+      };
+      await readWeather(LAT, LON).catch(() => {});
+      check('失败后挂上一个补拉待办', weatherStatus().retryPending === true, JSON.stringify(weatherStatus().retryPending));
+      check('失败当下只打了一次网络（补拉不在请求路径上）', calls === 1, `calls=${calls}`);
+      await new Promise((r) => setTimeout(r, 90));
+      check('补拉在后台真的跑了一次并拿到数据', calls === 2 && weatherStatus().cached !== null, `calls=${calls}`);
+      check('补拉成功后待办清空', weatherStatus().retryPending === false);
+
+      clearWeatherCache();
+      calls = 0;
+      globalThis.fetch = async () => { calls += 1; throw new TypeError('stub: 一直断'); };
+      await readWeather(LAT, LON).catch(() => {});
+      await new Promise((r) => setTimeout(r, 90));
+      check('补拉也失败时只补一次（1 次原始 + 1 次补拉）', calls === 2, `calls=${calls}`);
+      await new Promise((r) => setTimeout(r, 90));
+      check('补拉失败后不再排下一次（断网时不变成轮询）', calls === 2, `calls=${calls}`);
+
+      clearWeatherCache();
+      calls = 0;
+      setWeatherRetryDelayForTest(60);
+      globalThis.fetch = async () => {
+        calls += 1;
+        if (calls === 1) throw new TypeError('stub: 首个失败');
+        return okResponse();
+      };
+      await readWeather(LAT, LON).catch(() => {});
+      await readWeather(LAT, LON, { force: true }); // 期间手动刷到了新鲜数据
+      const callsAfterFresh = calls;
+      await new Promise((r) => setTimeout(r, 120));
+      check('期间已有新数据 → 到点的补拉直接跳过', calls === callsAfterFresh, `calls=${calls}`);
+
+      clearWeatherCache();
+      calls = 0;
+      globalThis.fetch = async () => { calls += 1; throw new TypeError('stub: 断'); };
+      await readWeather(LAT, LON).catch(() => {});
+      check('再次失败仍有待办（用来验证取消）', weatherStatus().retryPending === true);
+      clearWeatherCache();
+      check('clearWeatherCache（换位置）会取消待办', weatherStatus().retryPending === false);
+      await new Promise((r) => setTimeout(r, 90));
+      check('取消后到点也不会再打网络', calls === 1, `calls=${calls}`);
+      setWeatherRetryDelayForTest(25000); // 还原生产值，别影响后面的用例
     } finally {
       globalThis.fetch = realFetch;
       Date.now = realNow;
