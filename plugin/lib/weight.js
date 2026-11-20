@@ -517,7 +517,9 @@ function saveWeightRows(dbPath, rows) {
 /**
  * 本地库 → 曲线点。口径是「最近**有数据的** 7 个测量日」：
  * 同一天多称几次只留最后一次，日期可以不连续。
- * @param {string} dbPath @returns {{points:object[],lastSyncAt:number|null}} local snapshot
+ * 平均体重（v1.1.8）= 这 7 个点的算术平均，四舍五入到 2 位（与点值同精度）。
+ * 它是「每天最后一次」的平均，不是「每次称重」的平均——同一天称 3 次不会被算 3 份权重。
+ * @param {string} dbPath @returns {{points:object[],lastSyncAt:number|null,average:number|null}} local snapshot
  */
 function readWeightLocal(dbPath) {
   const db = openWeightDb(dbPath);
@@ -533,9 +535,16 @@ function readWeightLocal(dbPath) {
       if (points.length >= WEIGHT_DAYS) break;
     }
     points.reverse(); // 升序：左旧右新
+    const average = points.length
+      ? Math.round((points.reduce((sum, p) => sum + p.weight_kg, 0) / points.length) * 100) / 100
+      : null;
     const meta = db.prepare('SELECT value FROM meta WHERE key = ?').get('lastSyncAt');
     const lastSyncAt = Number(meta?.value);
-    return { points, lastSyncAt: Number.isFinite(lastSyncAt) && lastSyncAt > 0 ? lastSyncAt : null };
+    return {
+      points,
+      lastSyncAt: Number.isFinite(lastSyncAt) && lastSyncAt > 0 ? lastSyncAt : null,
+      average,
+    };
   } catch (error) {
     if (error instanceof MiCloudError) throw error;
     throw new MiCloudError('local', `体重读库失败：${error instanceof Error ? error.message : String(error)}`);
@@ -594,6 +603,7 @@ export async function readWeight(config = {}, options = {}) {
           reason: 'cloud',
           lastSyncAt: local.lastSyncAt,
           points: local.points,
+          average: local.average ?? null,
           archived: 0,
           error: '小米云返回 0 条记录，但本地已有历史数据',
         };
@@ -606,11 +616,12 @@ export async function readWeight(config = {}, options = {}) {
         // 这里读回来，避免「0 条也把时间戳推到刚刚」。
         lastSyncAt: local.lastSyncAt,
         points: local.points,
+        average: local.average ?? null,
         archived: rows.length,
       };
     } catch (error) {
       const reason = error instanceof MiCloudError ? error.reason : 'cloud';
-      let local = { points: [], lastSyncAt: null };
+      let local = { points: [], lastSyncAt: null, average: null };
       try {
         local = readWeightLocal(dbPath);
       } catch { /* 本地库也没有 → 空数组，前端显示占位文案 */ }
@@ -620,6 +631,7 @@ export async function readWeight(config = {}, options = {}) {
         reason,
         lastSyncAt: local.lastSyncAt,
         points: local.points,
+        average: local.average ?? null,
         error: error instanceof Error ? error.message : String(error),
       };
     }

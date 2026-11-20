@@ -24,12 +24,14 @@ if (!window.__lifehudClientRegistered) {
       const PANEL_ID = 'lifehud';
       const NS = 'lifehud';
       /** 客户端构建标记：改这里 → 页面上能一眼看出加载的是哪一版。 */
-      const BUILD = '1.1.7';
+      const BUILD = '1.1.8';
       const HUD_URL = '/lifehud/api/hud';
       const WEIGHT_URL = '/lifehud/api/weight';
       const SETTINGS_URL = '/lifehud/api/settings';
       const SESSION_EXISTS_URL = '/lifehud/api/session-exists';
       const UPDATE_URL = '/lifehud/api/update';
+      /** 收件箱录入（v1.1.8）：POST {title, note} → 往 NowTree 的 Inbox 追加一条。 */
+      const INBOX_URL = '/lifehud/api/inbox';
       const SETTINGS_KEY = 'lifehud.settings.v1';
       /** 上次「检查更新」的结果（用户只手动查，所以要记住上次查到了什么）。 */
       const UPDATE_STORE_KEY = 'lifehud.update.v1';
@@ -60,24 +62,29 @@ if (!window.__lifehudClientRegistered) {
        */
       const HUD_REFRESH_MS = 5 * 60 * 1000;
       let prefetch = null;
+      /** 请求序号：强制刷新取代先前在飞的普通请求时，旧响应不许回写 hudCache。 */
+      let hudSeq = 0;
 
-      function fetchHud() {
-        if (prefetch) return prefetch;
-        prefetch = fetch(HUD_URL, { headers: { accept: 'application/json' } })
+      /**
+       * @param {boolean} [force] 用户自己点了「刷新」→ 带 ?force=1，
+       *   Host 侧天气跳过 10 分钟 TTL **和失败冷却**（v1.1.8）。不带 force 时行为与旧版一致。
+       */
+      function fetchHud(force = false) {
+        if (!force && prefetch) return prefetch;
+        const seq = ++hudSeq;
+        const request = fetch(force ? `${HUD_URL}?force=1` : HUD_URL, { headers: { accept: 'application/json' } })
           .then((res) => {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return res.json();
           })
           .then((data) => {
-            hudCache = { at: Date.now(), value: data };
-            prefetch = null;
+            if (seq === hudSeq) hudCache = { at: Date.now(), value: data };
             return data;
           })
-          .catch(() => {
-            prefetch = null;
-            return null;
-          });
-        return prefetch;
+          .catch(() => null)
+          .finally(() => { if (prefetch === request) prefetch = null; });
+        if (!force) prefetch = request;
+        return request;
       }
 
       function defaultSettings() {
@@ -228,11 +235,15 @@ if (!window.__lifehudClientRegistered) {
           loading: !hudCache, data: hudCache?.value ?? null, error: null,
         });
         const [tick, setTick] = React.useState(0);
+        // 这次 tick 要不要强制刷新（工具条「刷新」按钮 = true）。
+        const forceRef = React.useRef(false);
         React.useEffect(() => {
-          if (tick === 0 && hudCache && Date.now() - hudCache.at < HUD_TTL) return undefined;
+          const force = forceRef.current;
+          forceRef.current = false;
+          if (!force && tick === 0 && hudCache && Date.now() - hudCache.at < HUD_TTL) return undefined;
           let alive = true;
           prefetch = null;
-          fetchHud().then((data) => {
+          fetchHud(force).then((data) => {
             if (!alive) return;
             if (data) setState({ loading: false, data, error: null });
             else setState({ loading: false, data: hudCache?.value ?? null, error: '请求失败' });
@@ -275,7 +286,15 @@ if (!window.__lifehudClientRegistered) {
           };
         }, []);
 
-        return { ...state, reload: () => setTick((v) => v + 1) };
+        return {
+          ...state,
+          // force=true：连 Host 侧的天气冷却也跳过（工具条「刷新」用），
+          // 免得「点了刷新还是那句取不到」——那正是 v1.1.8 要修的体感。
+          reload: (force) => {
+            forceRef.current = Boolean(force);
+            setTick((v) => v + 1);
+          },
+        };
       }
 
       /* -------------------------------------------------------------- 体重数据 */
@@ -427,13 +446,31 @@ if (!window.__lifehudClientRegistered) {
       ].join('');
 
       function Card(props) {
+        // `action`（v1.1.8）：标题右侧的卡片级操作，目前只有任务卡的「+」（记一条到收件箱）。
+        // 做成标题行的右端，而不是浮在卡片角上，这样标题与按钮共用一条基线，换字号也不会错位。
+        const head = props.title || props.action
+          ? h('div', {
+            key: 'head',
+            style: {
+              ...S.cardTitle,
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10,
+              ...(props.titleStyle ?? {}),
+            },
+          }, [
+            h('div', {
+              key: 't',
+              style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+            }, props.title ?? ''),
+            props.action ? h('div', { key: 'a', style: { flex: 'none', display: 'flex' } }, props.action) : null,
+          ])
+          : null;
         return h('div', {
           className: `lh-cell${props.wide ? ' lh-cell-wide' : ''}`,
           // cellStyle 调的是「格子」的宽度比例（行内 flex 子项），不影响卡片内边距
           style: props.cellStyle ?? undefined,
         },
           h('div', { style: { ...S.card, ...(props.style ?? {}) } }, [
-            props.title ? h('div', { key: 'head', style: { ...S.cardTitle, ...(props.titleStyle ?? {}) } }, props.title) : null,
+            head,
             h('div', {
               key: 'body',
               style: { flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' },
@@ -713,6 +750,7 @@ if (!window.__lifehudClientRegistered) {
       function WeightPlotSvg(props) {
         const { ticks, n, coords, line, area } = props.layout;
         const hover = Number.isInteger(props.hoverIndex) ? props.hoverIndex : null;
+        const avgY = Number.isFinite(props.avgY) ? props.avgY : null;
         const W = WEIGHT_VIEW.w;
         const H = WEIGHT_VIEW.h;
         const grid = ticks.map((t) => h('line', {
@@ -758,6 +796,20 @@ if (!window.__lifehudClientRegistered) {
           style: { display: 'block', flex: '1 1 auto', minWidth: 0, minHeight: 0, overflow: 'visible' },
         }, [
           ...grid,
+          // 均值虚线（v1.1.8）：画在网格之上、折线之下。虚线间隔比网格粗一档（5 4 vs 2 3），
+          // 一眼能分清「这是均值、不是纵轴刻度」。
+          avgY !== null
+            ? h('line', {
+              key: 'avg',
+              x1: 0, x2: W,
+              y1: round6((avgY / 100) * H),
+              y2: round6((avgY / 100) * H),
+              stroke: 'rgba(128,128,128,0.6)',
+              strokeWidth: 1,
+              strokeDasharray: '5 4',
+              vectorEffect: 'non-scaling-stroke',
+            })
+            : null,
           guide,
           area
             ? h('polygon', { key: 'area', points: area, fill: 'rgba(128,128,128,0.12)', stroke: 'none' })
@@ -817,6 +869,13 @@ if (!window.__lifehudClientRegistered) {
         if (points.length === 0) return null;
         const layout = weightLayout(points);
         const label = weightHoverLabel(points, layout, hover);
+        // 均值线（v1.1.8）：Host 直接给 `average`（7 个测量日的算术平均）。
+        // 旧 Host 没这个字段时自己按同一批点算一遍——「虚线的位置」和「画出来的点」
+        // 永远来自同一组数，不会因为缓存/过滤不一致而错位。
+        const average = Number.isFinite(props.average)
+          ? props.average
+          : points.reduce((sum, p) => sum + p.weight_kg, 0) / points.length;
+        const avgY = ((layout.axis.max - average) / ((layout.axis.max - layout.axis.min) || 1)) * 100;
         return h('div', {
           style: { flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column', marginTop: 6 },
         }, [
@@ -840,24 +899,36 @@ if (!window.__lifehudClientRegistered) {
               h('div', {
                 key: 'svg',
                 style: { position: 'absolute', left: WEIGHT_GUTTER, right: 0, top: 0, bottom: 0, display: 'flex' },
-              }, h(WeightPlotSvg, { layout, hoverIndex: hover, onHover: setHover })),
-              // 悬停点值：同一时刻只有一个，字号与天气卡逐小时温度一致（12.5 / 600）
+              }, h(WeightPlotSvg, { layout, hoverIndex: hover, onHover: setHover, avgY })),
+              // 悬停点值 + 均值标注：同一时刻只有一个悬停标签，字号与天气卡逐小时温度一致（12.5 / 600）
               h('div', {
                 key: 'vals',
                 style: {
                   position: 'absolute', left: WEIGHT_GUTTER, right: 0, top: 0, bottom: 0,
                   pointerEvents: 'none',
                 },
-              }, label ? h('div', {
-                key: label.key,
-                style: {
-                  position: 'absolute', left: `${label.left}%`, top: `${label.top}%`,
-                  // 往上多抬一点（-150% ≈ 与圆点留 ~7px 空隙），读数时不压住那条线
-                  transform: `translate(-50%, ${label.below ? '22%' : '-150%'})`,
-                  fontSize: 12.5, fontWeight: 600, lineHeight: 1.1, whiteSpace: 'nowrap',
-                  color: 'currentColor', fontVariantNumeric: 'tabular-nums',
-                },
-              }, label.text) : null),
+              }, [
+                // 均值：贴在虚线右端上方，解释那条虚线；和点值标签分开（点值只在悬停时出现）。
+                h('div', {
+                  key: 'avg',
+                  style: {
+                    position: 'absolute', right: 0, top: `${avgY}%`,
+                    transform: 'translateY(-118%)',
+                    fontSize: 11, lineHeight: 1, whiteSpace: 'nowrap',
+                    color: 'rgba(128,128,128,0.9)', fontVariantNumeric: 'tabular-nums',
+                  },
+                }, `均值 ${fmtWeightValue(average)}`),
+                label ? h('div', {
+                  key: label.key,
+                  style: {
+                    position: 'absolute', left: `${label.left}%`, top: `${label.top}%`,
+                    // 往上多抬一点（-150% ≈ 与圆点留 ~7px 空隙），读数时不压住那条线
+                    transform: `translate(-50%, ${label.below ? '22%' : '-150%'})`,
+                    fontSize: 12.5, fontWeight: 600, lineHeight: 1.1, whiteSpace: 'nowrap',
+                    color: 'currentColor', fontVariantNumeric: 'tabular-nums',
+                  },
+                }, label.text) : null,
+              ]),
             ]),
           ]),
           h(WeightLabels, { key: 'lbl', points, gutter: WEIGHT_GUTTER }),
@@ -913,7 +984,7 @@ if (!window.__lifehudClientRegistered) {
               }, `最后同步：${relTime(data.lastSyncAt)}`)
               : null,
           ]),
-          h(WeightChart, { key: 'chart', points }),
+          h(WeightChart, { key: 'chart', points, average: data.average }),
           staleText
             ? h('div', {
               key: 'stale',
@@ -1417,6 +1488,114 @@ if (!window.__lifehudClientRegistered) {
         ]);
       }
 
+      /* ------------------------------------------------------------ 收件箱弹窗 */
+
+      /**
+       * 「+」→ 记一条到 NowTree 的 Inbox（v1.1.8）。
+       *
+       * 为什么是弹窗而不是标题行里塞个输入框：要填「标题 + 备注」两栏，标题行只有 13px 高；
+       * 而且这是 LifeHud **唯一一处往别人的库里写**，值得一次明确的动作。
+       * 只发一次 POST：成功立刻关窗 + toast；失败把 Host 的中文原因原样显示，不自动重试。
+       */
+      function InboxDialog(props) {
+        const [title, setTitle] = React.useState('');
+        const [note, setNote] = React.useState('');
+        const [busy, setBusy] = React.useState(false);
+        const [err, setErr] = React.useState(null);
+        const titleRef = React.useRef(null);
+        React.useEffect(() => {
+          try { titleRef.current?.focus(); } catch { /* 某些环境不支持 focus，忽略 */ }
+        }, []);
+
+        const field = { display: 'grid', gap: 8, marginBottom: 16, fontSize: 13.5 };
+        const input = {
+          width: '100%', boxSizing: 'border-box', padding: '8px 11px', fontSize: 13.5,
+          color: T.text, background: '#2c2c2e', border: 'none', borderRadius: 10,
+          fontFamily: 'inherit',
+        };
+        const pill = (primary) => ({
+          fontSize: 13, padding: '8px 18px', borderRadius: 980, border: 'none',
+          cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1,
+          background: primary ? T.text : '#2c2c2e', color: primary ? '#000' : T.text2,
+        });
+
+        const submit = async () => {
+          if (busy) return;
+          const clean = title.trim();
+          if (!clean) { setErr('标题不能为空'); return; }
+          setBusy(true);
+          setErr(null);
+          try {
+            const res = await fetch(INBOX_URL, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ title: clean, note }),
+            });
+            const payload = await res.json().catch(() => null);
+            if (!res.ok || !payload?.ok) throw new Error(payload?.error ?? `HTTP ${res.status}`);
+            props.onDone(payload.task ?? { title: clean });
+          } catch (e) {
+            setErr(e?.message ?? String(e));
+            setBusy(false);
+          }
+        };
+
+        return h('div', {
+          style: {
+            position: 'fixed', inset: 0, zIndex: 9999, background: 'rgba(0,0,0,0.55)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', backdropFilter: 'blur(6px)',
+          },
+          onClick: busy ? undefined : props.onClose,
+        }, h('div', {
+          style: {
+            width: 420, maxWidth: '92vw', background: '#1c1c1e', color: T.text, borderRadius: 22,
+            padding: 22, border: '1px solid rgba(255,255,255,0.08)',
+          },
+          onClick: (e) => e.stopPropagation(),
+        }, [
+          h('div', {
+            key: 'h',
+            style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 16 },
+          }, [
+            h('div', { key: 't', style: { fontSize: 17, fontWeight: 600 } }, '记一条到收件箱'),
+            h('button', { key: 'x', type: 'button', style: S.btn, onClick: props.onClose }, '取消'),
+          ]),
+          h('div', { key: 'title', style: field }, [
+            h('div', { key: 'l', style: { color: T.text2 } }, '标题'),
+            h('input', {
+              key: 'i',
+              ref: titleRef,
+              style: input,
+              value: title,
+              maxLength: 200,
+              placeholder: '想到什么就写什么',
+              onChange: (e) => setTitle(e.target.value),
+              onKeyDown: (e) => { if (e.key === 'Enter') { e.preventDefault(); void submit(); } },
+            }),
+          ]),
+          h('div', { key: 'note', style: field }, [
+            h('div', { key: 'l', style: { color: T.text2 } }, '备注'),
+            h('textarea', {
+              key: 'i',
+              style: { ...input, minHeight: 74, resize: 'vertical', lineHeight: 1.5 },
+              value: note,
+              maxLength: 2000,
+              placeholder: '补充说明（可以空着）',
+              onChange: (e) => setNote(e.target.value),
+            }),
+          ]),
+          h('div', { key: 'hint', style: { ...S.dim, marginBottom: 12 } },
+            '记到 NowTree 的 Inbox：不分类、不排时段，之后在 NowTree 里再整理'),
+          err ? h('div', { key: 'e', style: { fontSize: 12.5, color: '#ff453a', marginBottom: 10 } }, err) : null,
+          h('div', { key: 'acts', style: { display: 'flex', justifyContent: 'flex-end', gap: 10 } }, [
+            h('button', { key: 'c', type: 'button', style: pill(false), onClick: props.onClose }, '取消'),
+            h('button', {
+              key: 's', type: 'button', style: pill(true), disabled: busy, onClick: () => void submit(),
+            }, busy ? '记录中…' : '记到收件箱'),
+          ]),
+        ]));
+      }
+
       /* ---------------------------------------------------------------- 页面 */
 
       function createPage(ctx) {
@@ -1437,6 +1616,8 @@ if (!window.__lifehudClientRegistered) {
           // 页面加载**不发** /update 请求（用户选择「只在设置里手动点」）。
           const [updateState, setUpdateState] = React.useState(readUpdateSnapshot);
           const [updateBusy, setUpdateBusy] = React.useState(false);
+          // 收件箱弹窗（任务卡右上角「+」）
+          const [showInbox, setShowInbox] = React.useState(false);
 
           const say = React.useCallback((text) => {
             setToastText(text);
@@ -1476,11 +1657,13 @@ if (!window.__lifehudClientRegistered) {
 
           /**
            * 顶部「刷新」：一次动作同时刷新 HUD 快照与体重。
-           * 体重这边带 force=1 —— 跳过 Host 的 10 分钟云缓存，刚踩秤的新数据立刻可见。
-           * （HUD 侧不动 hudCache：万一这次请求失败，页面还能继续显示上一次的数据。）
+           * 两边都带 force：体重跳过 Host 的 10 分钟云缓存（刚踩秤立刻可见）；
+           * HUD 侧 force 让**天气**跳过 TTL 与失败冷却（v1.1.8）——以前冷却期内点刷新
+           * 只会拿回上一次的旧值，于是「点了几次刷新都还写着取不到最新天气」。
+           * （hudCache 只在请求成功时被替换：失败时页面继续显示上一次的数据。）
            */
           const onRefresh = () => {
-            reload();
+            reload(true);
             weight.reload(true);
           };
 
@@ -1535,20 +1718,24 @@ if (!window.__lifehudClientRegistered) {
           const openChat = () => window.open(settings.chatUrl || 'https://chat.deepseek.com/', '_blank', 'noopener');
 
           /* ---- 卡片 ---- */
-          // 天气卡底部一行状态：断线时明确告诉用户「数据是几点的」或「现在取不到」。
+          // 天气卡底部状态：断线时明确告诉用户「这份预报是什么时候取的」。
           // 数据来自 /hud 的 weatherDiag（Host 旧了就没有这个字段，整行不显示）。
-          // 措辞要点（2026-11-19 用户反馈改）：必须说清是**取数时刻**，
-          // 不能写成「显示的是 4 小时前的数据」——那样会被读成「数据覆盖的是 4 小时前」。
+          // 措辞要点（v1.1.8 按用户反馈再改）：
+          //   ① 必须说清是**取数时刻**，不能写成「显示的是 4 小时前的数据」；
+          //   ② 必须说「预报」而不是「数据」——卡片上的温度是**按当前小时从这份预报里挑的**，
+          //      所以小时一过数字就会变，看起来像「刚更新过」，其实预报本身还是几小时前的。
+          //      用户 2026-11-20 就是被这一点骗到的：「数据明明更新了，备注却说 10 小时前」。
+          //   ③ 这行紧贴大温度（左栏），不再缩在卡片右下角——离数字太远就等于没写。
           const weatherDiag = data?.weatherDiag ?? null;
           const weatherStale = Boolean(weatherDiag?.failed);
           const weatherNote = !weatherDiag ? '' : (() => {
             const at = weatherDiag.cached?.at;
-            if (weather && at) {
-              return weatherStale ? `取不到最新天气 · 数据取于 ${hhmm(at)}（${relTime(at)}）` : '';
+            // 有缓存：只有这次真的没取到才提示（正常时一个字都不写）
+            if (at) return weatherStale ? `取不到最新天气 · 这份预报取于 ${hhmm(at)}（${relTime(at)}）` : '';
+            if (weatherStale) {
+              return weatherDiag.failed?.at ? `现在取不到 · ${relTime(weatherDiag.failed.at)}试过一次` : '正在获取…';
             }
-            if (at) return `取不到最新天气 · 数据取于 ${hhmm(at)}（${relTime(at)}）`;
-            if (!weather) return weatherDiag.failed?.at ? `现在取不到 · ${relTime(weatherDiag.failed.at)}试过一次` : '正在获取…';
-            return '';
+            return weather ? '' : '正在获取…';
           })();
 
           const weatherCard = h(Card, {
@@ -1563,14 +1750,22 @@ if (!window.__lifehudClientRegistered) {
           }, h('div', { key: 'wcol', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } }, [
             weather
               ? h('div', { key: 'wb', style: { display: 'flex', alignItems: 'center', gap: 28, flexWrap: 'wrap', justifyContent: 'center', height: '100%' } }, [
-                // 左：大温度 + 一句话；右：连续 8 小时（英雄卡是通栏，横向给足）
-                h('div', { key: 'left', style: { flex: '0 0 auto' } }, [
+                // 左：大温度 + 一句话 +（断线时）数据时效；右：连续 8 小时（英雄卡是通栏，横向给足）
+                h('div', { key: 'left', style: { flex: '0 1 auto', minWidth: 0, maxWidth: 280 } }, [
                   h('div', { key: 'row', style: { display: 'flex', alignItems: 'baseline', gap: 10 } }, [
                     h(WeatherIcon, { key: 'i', kind: weather.nowIcon ?? 'cloud', size: 26 }),
                     h('div', { key: 'n', style: { fontSize: 46, fontWeight: 600, letterSpacing: '-0.04em', lineHeight: 1 } }, `${Math.round(weather.now)}`),
                     h('div', { key: 'u', style: { fontSize: 16, color: '#c9def5' } }, `℃ ${weather.nowText ?? ''}`),
                   ]),
                   h('div', { key: 's', style: { fontSize: 13, color: '#c9def5', marginTop: 6 } }, weather.summary),
+                  // 时效提示紧贴温度：贴在卡片右下角离数字太远，等于没写（v1.1.8 用户实测）。
+                  weatherNote
+                    ? h('div', {
+                      key: 'wn',
+                      title: '天气服务这次没连上，显示的是上次成功取到的预报；工具条「刷新」可强制重试',
+                      style: { fontSize: 11.5, color: '#9ec6ee', marginTop: 5, lineHeight: 1.5, opacity: 0.9 },
+                    }, weatherNote)
+                    : null,
                 ]),
                 h('div', { key: 'right', style: { flex: '1 1 380px', minWidth: 0 } },
                   h(HourlyStrip, {
@@ -1579,33 +1774,63 @@ if (!window.__lifehudClientRegistered) {
                   })),
               ])
               : h('div', { key: 'e', style: { ...S.empty, color: '#c9def5' } }, '天气取不到'),
-            weatherNote
-              ? h('div', {
-                key: 'wn',
-                style: { fontSize: 11.5, color: '#9ec6ee', marginTop: 6, textAlign: 'right' },
-              }, weatherNote)
+          ]));
+
+          const tasksCard = h(Card, {
+            key: 'tasks',
+            title: '当前时段任务',
+            // 右上角「+」：直接记一条到 NowTree 的 Inbox（v1.1.8，唯一的写入路径）。
+            action: h('button', {
+              type: 'button',
+              title: '记一条到 NowTree 收件箱',
+              'aria-label': '记一条到 NowTree 收件箱',
+              onClick: () => setShowInbox(true),
+              style: {
+                width: 22, height: 22, borderRadius: 11, padding: 0, border: 'none', cursor: 'pointer',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(128,128,128,0.16)', color: T.text2,
+                transition: 'background .15s ease, color .15s ease',
+              },
+              onMouseEnter: (e) => {
+                e.currentTarget.style.background = 'rgba(128,128,128,0.3)';
+                e.currentTarget.style.color = T.text;
+              },
+              onMouseLeave: (e) => {
+                e.currentTarget.style.background = 'rgba(128,128,128,0.16)';
+                e.currentTarget.style.color = T.text2;
+              },
+            }, h('svg', {
+              key: 'plus', width: 12, height: 12, viewBox: '0 0 12 12', 'aria-hidden': 'true', focusable: 'false',
+            }, h('path', {
+              d: 'M6 1.6v8.8M1.6 6h8.8', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round',
+            }))),
+          }, h('div', {
+            key: 'w', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
+          }, [
+            tasks.items.length === 0
+              ? h('div', { key: 'e', style: { ...S.empty, flex: '1 1 auto' } }, `${clock.label ?? '这个时段'}没有安排任务`)
+              : h('div', { key: 'items', style: { flex: '1 1 auto', minHeight: 0 } },
+                tasks.items.slice(0, 5).map((item) => h('div', {
+                  key: item.id, style: { ...S.item, padding: '7px 0' },
+                }, [
+                  h('span', { key: 'd', style: { width: 6, height: 6, borderRadius: 3, background: T.text2, flex: 'none' } }),
+                  h('span', { key: 't', style: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title),
+                ]))),
+            tasks.items.length > 5
+              ? h('div', { key: 'm', style: S.more }, `余下 ${tasks.items.length - 5} 条`)
+              : null,
+            // 刚记完一条 inbox 记录时，它不会出现在「当前时段」列表里（inbox 没有 time_slot），
+            // 所以这里给一行计数当下落反馈，否则用户会以为没写进去。
+            Number.isFinite(tasks.inboxCount) && tasks.inboxCount > 0
+              ? h('div', { key: 'ib', style: { ...S.more, marginTop: 4 } }, `NowTree 收件箱 ${tasks.inboxCount} 条`)
               : null,
           ]));
 
-          const tasksCard = h(Card, { key: 'tasks', title: '当前时段任务' },
-            tasks.items.length === 0
-              ? h('div', { key: 'e', style: S.empty }, `${clock.label ?? '这个时段'}没有安排任务`)
-              : h('div', { key: 'l', style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 } }, [
-                h('div', { key: 'items', style: { flex: 1, minHeight: 0 } },
-                  tasks.items.slice(0, 5).map((item) => h('div', {
-                    key: item.id, style: { ...S.item, padding: '7px 0' },
-                  }, [
-                    h('span', { key: 'd', style: { width: 6, height: 6, borderRadius: 3, background: T.text2, flex: 'none' } }),
-                    h('span', { key: 't', style: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, item.title),
-                  ]))),
-                tasks.items.length > 5
-                  ? h('div', { key: 'm', style: S.more }, `余下 ${tasks.items.length - 5} 条`)
-                  : null,
-              ]));
-
           // 专注卡：三种状态 —— 关掉了 / 有数据 / 还没采到。
           // 空态文案不再提 ActivityWatch：数据已改成本机自采集，那个名字对用户只是噪音。
-          // 「最长」原来是没人用的死字段；现在渲染在条形图下面（app 已由 Host 套过别名，与 top 一致）。
+          // 「连续最长」（v1.1.8，原来叫「最长」）：同一应用连续使用最久的一段。
+          // 老口径是「单个窗口事件」，换个视频标题一变就断，于是 27 分钟连续看 B 站只报 10 分钟，
+          // 用户 2026-11-20 直接问「这是什么意思」——所以既改了口径，也把名字说全。
           const focusCard = h(Card, { key: 'focus', title: '专注 · 最近 24 小时' },
             focusOn
               ? (focus?.available
@@ -1619,8 +1844,9 @@ if (!window.__lifehudClientRegistered) {
                         ...S.dim, flex: 'none', marginTop: 8, overflow: 'hidden',
                         textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       },
-                      title: focus.longest.title || undefined,
-                    }, `最长：${focus.longest.app} · ${Math.round(focus.longest.minutes)} 分钟`)
+                      title: `同一应用连续使用最久的一段（中间切走不超过 1 分钟算连续，已扣掉离开时间）`
+                        + (focus.longest.title ? `\n${focus.longest.title}` : ''),
+                    }, `连续最长：${focus.longest.app} · ${fmtDuration(focus.longest.minutes)}`)
                     : null,
                 ])
                 : h('div', { key: 'e', style: S.empty }, '还没有采集到数据'))
@@ -1709,6 +1935,16 @@ if (!window.__lifehudClientRegistered) {
               : rows,
 
             h(Toast, { key: 'toast', text: toast }),
+            showInbox ? h(InboxDialog, {
+              key: 'inbox',
+              onClose: () => setShowInbox(false),
+              onDone: (task) => {
+                setShowInbox(false);
+                say(`已记到 NowTree 收件箱：${task?.title ?? ''}`);
+                // 普通刷新即可（不要 force：这条路径不需要为了一个计数去打天气）。
+                reload();
+              },
+            }) : null,
             showSettings ? h(SettingsDialog, {
               key: 'dlg', settings, onChange: onChangeSettings,
               onClose: () => setShowSettings(false),

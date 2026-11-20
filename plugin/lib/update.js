@@ -41,8 +41,17 @@ function readOwnVersion() {
   }
 }
 
-/** 本进程里 Host 的版本（模块加载时读一次）。 */
-const PLUGIN_VERSION = readOwnVersion();
+/**
+ * 当前 Host 版本：**每次调用都从 package.json 读**（v1.1.8 改）。
+ *
+ * 原来这里是模块加载时读一次的常量，于是「改了版本号、但插件重装只换了文件而没重启」
+ * 的时候 `/hud` 还报旧版本，页面据此提示「页面资源旧了，按 Ctrl+F5」——一个假警报。
+ * package.json 只有几百字节，一次 /hud 读一次可以忽略；换来的是版本永远说实话。
+ * @returns {string} e.g. '1.1.8'；读不到就空串
+ */
+export function pluginVersion() {
+  return readOwnVersion();
+}
 
 /**
  * 解析 `v1.2.3` / `1.2.3-rc.1` 形状的版本号。
@@ -111,7 +120,7 @@ async function githubJson(url, fetchImpl) {
   const res = await fetchImpl(url, {
     headers: {
       accept: 'application/vnd.github+json',
-      'user-agent': `dsh-lifehud/${PLUGIN_VERSION || '0.0.0'}`,
+      'user-agent': `dsh-lifehud/${readOwnVersion() || '0.0.0'}`,
     },
     signal: AbortSignal.timeout(UPDATE_TIMEOUT_MS),
   });
@@ -152,7 +161,7 @@ function updateReasonOf(error) {
  * @returns {Promise<object>} snapshot
  */
 export async function readUpdate(config = {}, options = {}) {
-  const current = PLUGIN_VERSION;
+  const current = readOwnVersion();
   const repo = updateRepoOf(config);
   const base = {
     ok: true,
@@ -252,4 +261,3 @@ export async function readUpdate(config = {}, options = {}) {
   updateInflight.set(repo, tracked);
   return run;
 }
-export { PLUGIN_VERSION };

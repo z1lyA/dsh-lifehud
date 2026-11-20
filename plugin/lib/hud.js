@@ -8,8 +8,9 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readOwnActivity, emptyActivity } from './activity.js';
 import { captureStatus, captureWarnings } from './capture.js';
+import { countInboxTasks } from './inbox.js';
 import { readSettingsFile } from './settings.js';
-import { PLUGIN_VERSION } from './update.js';
+import { pluginVersion } from './update.js';
 import { envPath } from './util.js';
 
 const DEFAULT_BOUNDS = { morningStart: 6, noonStart: 13, eveningStart: 18 };
@@ -34,6 +35,16 @@ const WEATHER_FAIL_COOLDOWN_MS = 2 * 60 * 1000;
 
 /** NowTree 的 SQLite（`%APPDATA%\com.nowtree.app\nowtree.sqlite`）。 */
 const defaultNowtreeDb = () => envPath(process.env.APPDATA ?? '', 'com.nowtree.app', 'nowtree.sqlite');
+
+/**
+ * NowTree 的库路径：读（当前时段任务）和写（收件箱录入）必须用同一个口径。
+ * 写成函数导出，是为了让 `index.js` 的收件箱路由不必自己再推导一遍。
+ * @param {object} [config] bundle row config
+ * @returns {string} path
+ */
+export function nowtreeDbPath(config = {}) {
+  return String(config.nowtreeDb ?? '') || defaultNowtreeDb();
+}
 
 /** NowTree 的 WebView2 localStorage（`%LOCALAPPDATA%\com.nowtree.app\EBWebView\…`）。 */
 const defaultLeveldbDir = () => envPath(process.env.LOCALAPPDATA ?? '', 'com.nowtree.app',
@@ -276,16 +287,23 @@ const staleWeather = (key) => (weatherCache && weatherCache.key === key ? weathe
  * 不能让每个请求都等满一个超时（当时实测 6.02s/次，页面「一直很慢」）：
  *   1. 失败后进入 `WEATHER_FAIL_COOLDOWN_MS` 冷却 —— 期间直接返回上次的值/空，不再打网络；
  *   2. 并发请求单飞 —— N 个请求共用一次尝试，不会叠加成 N×超时。
+ *
+ * `options.force`（v1.1.8）：用户自己点了「刷新」，**跳过 TTL 与冷却**，老老实实打一次网络。
+ * 这是 v1.1.8 修的那个「备注有滞后性」：冷却期内点刷新只会拿回上一次的旧值，
+ * 于是数据明明能取到、卡片却还写着「取不到最新天气」——用户点一次就该知道到底通不通。
+ * 单飞仍然生效（force 也不例外）：N 个并发的强制刷新只打一次网络。
  * @param {number} lat @param {number} lon
+ * @param {{force?:boolean}} [options] force 跳过 TTL 与失败冷却
  * @returns {Promise<object|null>} weather
  */
-export async function readWeather(lat, lon) {
+export async function readWeather(lat, lon, options = {}) {
   const key = `${lat},${lon}`;
+  const force = Boolean(options.force);
   loadStoredWeather(); // 重启后先把上次成功的值捞回来，才能兜底
-  if (weatherCache && weatherCache.key === key && Date.now() - weatherCache.at < WEATHER_TTL_MS) {
+  if (!force && weatherCache && weatherCache.key === key && Date.now() - weatherCache.at < WEATHER_TTL_MS) {
     return weatherCache.value;
   }
-  if (weatherFail && weatherFail.key === key && Date.now() - weatherFail.at < WEATHER_FAIL_COOLDOWN_MS) {
+  if (!force && weatherFail && weatherFail.key === key && Date.now() - weatherFail.at < WEATHER_FAIL_COOLDOWN_MS) {
     return staleWeather(key);
   }
   if (weatherInflight && weatherInflight.key === key) return weatherInflight.promise;
@@ -397,14 +415,15 @@ function readSessions(projDir, limit, dshHome) {
  * Assemble the HUD snapshot.
  * @param {object} [config] bundle row config
  * @param {object} [runtime] extra runtime hooks ({ isRunning })
+ * @param {{force?:boolean}} [options] force 天气跳过 TTL/冷却（页面「刷新」走这条）
  * @returns {Promise<object>} payload
  */
-export async function buildHud(config = {}, runtime = {}) {
+export async function buildHud(config = {}, runtime = {}, options = {}) {
   const dataDir = String(config.dataDir ?? '') || join(homedir(), '.dsh', 'lifehud');
   const settings = readSettingsFile(dataDir);
   // 天气落盘位置（重启后靠它显示「上次的数据」）；每次 buildHud 赋值，配置变了也能跟上。
   weatherStorePath = join(dataDir, 'weather-cache.json');
-  const nowtreeDb = String(config.nowtreeDb ?? '') || defaultNowtreeDb();
+  const nowtreeDb = nowtreeDbPath(config);
   const leveldbDir = String(config.leveldbDir ?? '') || defaultLeveldbDir();
   const dshHome = String(config.dshHome ?? join(homedir(), '.dsh'));
   const sessionLimit = Number(config.sessionLimit ?? 5);
@@ -428,7 +447,7 @@ export async function buildHud(config = {}, runtime = {}) {
   const [activity, weather, sessions] = await Promise.all([
     // readOwnActivity 是同步的：包一层 Promise 才能和另外两路并发、也才能接住同步抛错。
     Promise.resolve().then(() => readOwnActivity(config, 84, aliases)).catch(failActivity),
-    readWeather(lat, lon).catch((error) => {
+    readWeather(lat, lon, { force: Boolean(options.force) }).catch((error) => {
       warnings.push(`weather: ${error instanceof Error ? error.message : String(error)}`);
       return weatherCache?.value ?? null;
     }),
@@ -437,8 +456,13 @@ export async function buildHud(config = {}, runtime = {}) {
   ]);
 
   let tasks = [];
+  // 收件箱计数（v1.1.8）：任务卡右上角刚记完一条，卡片底部要能立刻看到「收件箱 N 条」——
+  // inbox 记录没有 time_slot，不会出现在「当前时段」列表里，没有这行就等于什么都没发生。
+  // 读不到（库被锁/结构不对）就是 null，页面不显示这行，绝不让它影响 /hud。
+  let inboxCount = null;
   try {
     tasks = readSlotTasks(nowtreeDb, slot);
+    inboxCount = countInboxTasks(nowtreeDb);
   } catch (error) {
     warnings.push(`nowtree: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -448,7 +472,7 @@ export async function buildHud(config = {}, runtime = {}) {
     generatedAt: new Date().toISOString(),
     // Host 侧版本（读自 plugin/package.json）。纯新增字段：页面用它显示「Host vX」，
     // 并和 client.js 的 BUILD 对比，提示「Host 升级了但页面资源还是旧的（Ctrl+R）」。
-    version: PLUGIN_VERSION,
+    version: pluginVersion(),
     clock: {
       hhmm: new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }),
       date: new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'short' }),
@@ -458,7 +482,7 @@ export async function buildHud(config = {}, runtime = {}) {
       bounds,
       boundsSource: discovered ? 'nowtree' : 'default',
     },
-    tasks: { slot, label: SLOT_LABEL[slot] ?? slot, range: slotRange(slot, bounds), items: tasks },
+    tasks: { slot, label: SLOT_LABEL[slot] ?? slot, range: slotRange(slot, bounds), items: tasks, inboxCount },
     // 当前小时按请求时刻重算：缓存/落盘的数据可能已经放了几小时，别把「现在」冻在取数那一刻。
     weather: refreshCurrentHour(weather),
     location: { latitude: lat, longitude: lon, name: settings.locationName ?? null },

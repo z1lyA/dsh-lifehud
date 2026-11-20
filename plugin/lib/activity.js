@@ -6,6 +6,14 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync } from 'node:fs';
 import { captureDbPath } from './capture.js';
 
+/**
+ * 「连续最长」的合并口径（v1.1.8）：同一应用相邻出现算一段，
+ * 中间切走不超过这么久就不算断（换视频 / 回消息再回来还是同一段）。
+ * 60 秒够盖住「点开另一个窗口看一眼就回来」，又不至于把上午下午两段完全无关的
+ * 使用粘成一段。秒数仍然扣 AFK，所以口径与 top / tracking 一致。
+ */
+const FOCUS_RUN_GAP_MS = 60 * 1000;
+
 /** Built-in friendly names for the apps the collector sees as `<name>.exe`. */
 const DEFAULT_APP_ALIASES = {
   'explorer.exe': '文件资源管理器',
@@ -198,8 +206,10 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
   const perDay = new Map();
   const recentByApp = new Map();
   let recentSeconds = 0;
-  let longest = { app: '', title: '', seconds: 0 };
   let considered = 0;
+  /** 当前这一段「连续使用」；与最长的段分开记（最长段只留结论，不占内存）。 */
+  let run = null;
+  let longest = { app: '', title: '', seconds: 0 };
   // 专注卡看的是**滚动 24 小时**：只算「今天」的话，一到晚上早上那段滚出去，
   // 卡片就会显得空。
   const since24 = now.getTime() - 24 * 3600 * 1000;
@@ -217,7 +227,6 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
     // v1.1.0 的老实现只把 AFK 扣进热力，24h 的 tracking/top/longest 用的是原始时长，
     // 于是出现过「tracking 705 分钟、而同一天热力只有 354 分钟」的自相矛盾（2026-11-10 验收发现）。
     const seconds = afkSpans.length > 0 ? activeSeconds(startMs, endMs) : duration;
-    if (seconds < 1) continue;
     // AFK 区间不精确切分到事件内部，按占比例摊到整段上：热力与 24h 数字用同一个比例，
     // 就不会再出现两套口径打架。
     const activeRatio = seconds / duration;
@@ -228,20 +237,43 @@ export function readOwnActivity(config = {}, days = 84, aliases = {}) {
     const titleName = String(data?.title ?? '');
     if (/^explorer\.exe$/i.test(appName) && /program manager/i.test(titleName)) continue;
 
-    considered += 1;
-    perDay.set(dayKey(startMs), (perDay.get(dayKey(startMs)) ?? 0) + seconds);
+    // 整段都在 AFK 里的事件对「活跃秒数」没有贡献（老实现这里直接 continue）：
+    // 不进热力、不算「有没有数据」，但**仍然参与下面的连续段合并**——
+    // 否则「看视频看到被判离开」会把一段连续使用切断。
+    if (seconds >= 1) {
+      considered += 1;
+      perDay.set(dayKey(startMs), (perDay.get(dayKey(startMs)) ?? 0) + seconds);
+    }
 
-    if (endMs < since24) continue;
     // 只算落在 24 小时窗口里的那一段，再乘活跃占比（同样是扣 AFK 后的口径）。
     const overlap = Math.max(0, (Math.min(endMs, now.getTime()) - Math.max(startMs, since24)) / 1000);
     const inside = overlap * activeRatio;
+
+    // ---- 「连续最长」的合并（v1.1.8）----
+    // 老口径 = 单个窗口事件：换个视频、标题一变就断，于是 27 分钟的连续观看被切成好几段，
+    // 最长那段只剩 10 分钟（2026-11-20 用户看不懂「最长：哔哩哔哩 · 10 分钟」）。
+    // 新口径：同一应用相邻出现就合成一段，中间切走不超过 FOCUS_RUN_GAP_MS 不算断。
+    // 秒数仍然是**扣掉 AFK** 的（与 top / tracking 同一口径），所以「开着页面去吃饭」不会赢。
+    const continues = run && run.app === appName && startMs - run.endMs <= FOCUS_RUN_GAP_MS;
+    if (continues) {
+      run.endMs = Math.max(run.endMs, endMs);
+      run.seconds += Math.max(0, inside);
+    } else {
+      run = { app: appName, endMs, seconds: Math.max(0, inside), title: '', bestTitleSeconds: 0 };
+    }
+    // 段内最活跃的那个标题拿去做 tooltip（比「第一段的标题」更能代表整段）。
+    if (titleName && Math.max(0, inside) > run.bestTitleSeconds) {
+      run.title = titleName;
+      run.bestTitleSeconds = Math.max(0, inside);
+    }
+    if (run.seconds > longest.seconds) {
+      // 与 top 同一套显示名（别名），别让同一个应用在卡片里有两个名字。
+      longest = { app: appDisplayName(appName, aliases), title: run.title, seconds: run.seconds };
+    }
+
     if (inside < 1) continue;
     recentSeconds += inside;
     recentByApp.set(appName, (recentByApp.get(appName) ?? 0) + inside);
-    if (inside > longest.seconds) {
-      // 与 top 同一套显示名（别名），别让同一个应用在卡片里有两个名字。
-      longest = { app: appDisplayName(appName, aliases), title: titleName, seconds: inside };
-    }
   }
 
   // 空闲强度（第三条流）：只累加落在 24h 窗口里的部分，按离散档位分组。

@@ -3,15 +3,17 @@
  *
  * Endpoints (all loopback-only):
  *   GET    /lifehud/api/hud       → tasks(current slot) + weather + sessions + focus + countdown
- *   GET    /lifehud/api/weight    → weight series (last 7 measured days) + sync state
+ *   GET    /lifehud/api/weight    → weight series (last 7 measured days) + average + sync state
  *   GET    /lifehud/api/countdown → 倒计时状态（单个，Host 侧计时）
  *   POST   /lifehud/api/countdown → { action: start|pause|resume|cancel, ms? }
+ *   POST   /lifehud/api/inbox     → 往 NowTree 的 Inbox 追加一条 {title, note?}（v1.1.8）
  *   GET    /lifehud/api/settings  → persisted settings (location etc.)
  *   POST   /lifehud/api/settings  → merge settings
  *   GET    /lifehud/api/update    → 检查远端有没有新版本（只读 GitHub，手动触发）
  *
- * 实现拆在 lib/ 下（v1.1.2 评审 S3）：capture / activity / weight / update / hud / settings / util。
- * 所有外部数据源只读；LifeHud 自己只写 <dataDir> 里的 capture.db 与体重镜像库。
+ * 实现拆在 lib/ 下（v1.1.2 评审 S3）：capture / activity / weight / update / hud / settings / util / inbox。
+ * 所有外部数据源只读，唯一例外是 `POST /inbox`：往 NowTree 的 transactions 表**追加**一行
+ * （只 INSERT，不改不删，见 lib/inbox.js）。
  *
  * @module dsh-lifehud
  */
@@ -19,7 +21,8 @@ import { readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildHud, clearWeatherCache } from './lib/hud.js';
+import { buildHud, clearWeatherCache, nowtreeDbPath } from './lib/hud.js';
+import { addInboxTask, countInboxTasks, InboxError } from './lib/inbox.js';
 import { readWeight, WEIGHT_TTL_MS } from './lib/weight.js';
 import { readUpdate } from './lib/update.js';
 import { importHistory, noteCapture, startCollector } from './lib/capture.js';
@@ -33,6 +36,7 @@ const API_PREFIX = '/lifehud/api';
 const HUD_PATH = `${API_PREFIX}/hud`;
 const WEIGHT_PATH = `${API_PREFIX}/weight`;
 const COUNTDOWN_PATH = `${API_PREFIX}/countdown`;
+const INBOX_PATH = `${API_PREFIX}/inbox`;
 const SETTINGS_PATH = `${API_PREFIX}/settings`;
 const SESSION_EXISTS_PATH = `${API_PREFIX}/session-exists`;
 const UPDATE_PATH = `${API_PREFIX}/update`;
@@ -233,7 +237,13 @@ function applyInner(ctx, config) {
           sendJson(res, 403, { ok: false, error: 'local access only' });
           return;
         }
-        buildHud(config, { isRunning })
+        // ?force=1 = 用户自己点了「刷新」：天气跳过 10 分钟 TTL **和失败冷却**，
+        // 老老实实打一次网络。冷却期内点刷新却拿回旧值，正是 v1.1.8 要修的那个「备注滞后」。
+        let force = false;
+        try {
+          force = new URL(String(req.url ?? ''), 'http://127.0.0.1').searchParams.get('force') === '1';
+        } catch { /* 非法 URL 就当普通请求 */ }
+        buildHud(config, { isRunning }, { force })
           // 倒计时随 /hud 一起下发（页面开着时卡片能立刻拿到权威状态）；
           // 它自己的增删改走 POST /lifehud/api/countdown。
           .then((payload) => sendJson(res, 200, { ...payload, countdown: countdownStatus() }))
@@ -266,6 +276,41 @@ function applyInner(ctx, config) {
           }));
       };
 
+      // 收件箱录入（v1.1.8）：任务卡右上角「+」→ 弹窗 → 这里。**唯一的写路径**。
+      // 只 INSERT 一行，不碰任何已有记录；失败一律带 reason 回页面，不重试、不落半截。
+      const inboxHandler = async (req, res) => {
+        if (!isLocalPeer(req)) {
+          sendJson(res, 403, { ok: false, error: 'local access only' });
+          return;
+        }
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: 'POST required' });
+          return;
+        }
+        // 留一个总开关：不想让 LifeHud 碰 NowTree 的库就 nowtreeWrite: false。
+        if (config.nowtreeWrite === false) {
+          sendJson(res, 403, { ok: false, reason: 'disabled', error: '配置里关掉了收件箱录入（nowtreeWrite: false）' });
+          return;
+        }
+        try {
+          const text = await readTextBody(req);
+          const body = text ? JSON.parse(text) : {};
+          const dbPath = nowtreeDbPath(config);
+          const task = addInboxTask(dbPath, { title: body?.title, note: body?.note });
+          sendJson(res, 200, { ok: true, task, inboxCount: countInboxTasks(dbPath) });
+        } catch (error) {
+          const reason = error instanceof InboxError ? error.reason : 'write';
+          const status = reason === 'title-required' || reason === 'title-too-long' || reason === 'note-too-long'
+            ? 400
+            : reason === 'busy' ? 409 : 500;
+          sendJson(res, status, {
+            ok: false,
+            reason,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      };
+
       const updateHandler = (req, res) => {
         if (req.method !== 'GET') {
           sendJson(res, 405, { ok: false, error: 'GET required' });
@@ -289,6 +334,7 @@ function applyInner(ctx, config) {
       const d3 = web.webServer.register({ kind: 'exact', path: SETTINGS_PATH, handler: settingsHandler });
       const d5 = web.webServer.register({ kind: 'exact', path: WEIGHT_PATH, handler: weightHandler });
       const d6 = web.webServer.register({ kind: 'exact', path: UPDATE_PATH, handler: updateHandler });
+      const d7 = web.webServer.register({ kind: 'exact', path: INBOX_PATH, handler: inboxHandler });
 
       // Cheap existence check so the page can refuse to navigate to a session whose
       // projection cache is gone (deleted session) instead of failing silently.
@@ -340,6 +386,7 @@ function applyInner(ctx, config) {
         try { d4(); } catch { /* disposed */ }
         try { d5(); } catch { /* disposed */ }
         try { d6(); } catch { /* disposed */ }
+        try { d7(); } catch { /* disposed */ }
       };
     }, 'lifehud: http routes');
   });
