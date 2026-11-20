@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { buildHud, openCaptureDb, readOwnActivity, readWeather, clearWeatherCache, weatherStatus, setWeatherRetryDelayForTest } from '../plugin/index.js';
+import { buildHud, openCaptureDb, readOwnActivity, readWeather, clearWeatherCache, weatherStatus, createWeatherSource } from '../plugin/index.js';
 import { NOWTREE_DB, NOWTREE_LEVELDB } from './paths.mjs';
 
 const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -23,6 +23,20 @@ function check(name, pass, detail = '') {
 }
 
 const MIN = 60 * 1000;
+
+/**
+ * 等到 predicate 成立或超时。
+ * 别用固定 `setTimeout(90)` 之类：Windows 计时粒度 15.6ms，机器一忙就会误判成"没发生"。
+ * @param {() => boolean} predicate @param {number} [timeoutMs] @returns {Promise<boolean>}
+ */
+async function waitFor(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return predicate();
+}
 
 /** 本地日期键 `YYYY-MM-DD`（与 Host 侧同口径）。 */
 function dayKey(ms) {
@@ -414,7 +428,7 @@ try {
         hourHud.weather?.nowIndex === wantHour,
         `nowIndex=${hourHud.weather?.nowIndex} 期望=${wantHour}`);
 
-      // 9) v1.1.8：force 必须跳过「失败冷却 + TTL」。
+      // 9) v1.1.8：`refresh`（= 用户点「刷新」）必须跳过「失败冷却 + TTL」。
       //    真机上踩到的：冷却的 2 分钟里点「刷新」只会拿回旧值，于是数据明明能取到、
       //    卡片却一直写着「取不到最新天气」——这就是用户说的「备注有滞后性」。
       clearWeatherCache();
@@ -423,12 +437,12 @@ try {
       await run();                                            // 失败 → 进冷却
       const blocked = await run();                            // 冷却期内：不打网络
       const callsBeforeForce = calls;
-      let forceThrew = false;
-      try { await readWeather(LAT, LON, { force: true }); } catch { forceThrew = true; } // 强制：必须真打一次
+      let refreshThrew = false;
+      try { await readWeather(LAT, LON, 'refresh'); } catch { refreshThrew = true; } // 强制：必须真打一次
       check('冷却期内的普通请求仍然不打网络（对照组）', callsBeforeForce === 1 && blocked === null,
         `calls=${callsBeforeForce}`);
-      check('force 跳过失败冷却（冷却期内点了刷新就真的重试）', calls === 2, `calls=${calls}`);
-      check('force 仍然把失败抛出去（不吞错、不假装成功）', forceThrew, String(forceThrew));
+      check('refresh 跳过失败冷却（冷却期内点了刷新就真的重试）', calls === 2, `calls=${calls}`);
+      check('refresh 仍然把失败抛出去（不吞错、不假装成功）', refreshThrew, String(refreshThrew));
 
       clearWeatherCache();
       calls = 0;
@@ -436,8 +450,8 @@ try {
       await run();                                            // 成功 → 缓存 10 分钟
       await run();                                            // TTL 内：不打网络
       const ttlCalls = calls;
-      await readWeather(LAT, LON, { force: true });            // 缓存新鲜也强制重取
-      check('force 跳过 10 分钟 TTL（缓存新鲜也真的重取）', ttlCalls === 1 && calls === 2, `calls=${calls}`);
+      await readWeather(LAT, LON, 'refresh');                  // 缓存新鲜也强制重取
+      check('refresh 跳过 10 分钟 TTL（缓存新鲜也真的重取）', ttlCalls === 1 && calls === 2, `calls=${calls}`);
 
       clearWeatherCache();
       calls = 0;
@@ -446,66 +460,106 @@ try {
         await new Promise((r) => setTimeout(r, 30));
         return okResponse();
       };
-      await Promise.all([readWeather(LAT, LON, { force: true }), readWeather(LAT, LON, { force: true })]);
-      check('force 也走单飞（两个并发强制刷新只打一次网络）', calls === 1, `calls=${calls}`);
+      await Promise.all([readWeather(LAT, LON, 'refresh'), readWeather(LAT, LON, 'refresh')]);
+      check('refresh 也走单飞（两个并发强制刷新只打一次网络）', calls === 1, `calls=${calls}`);
 
       // 页面侧：工具条「刷新」必须真的把 force 传下去，否则上面那条 Host 能力等于没用上。
       const clientSrc = readFileSync(join(REPO, 'plugin', 'client.js'), 'utf8');
       check('页面「刷新」走 force（reload(true) + ?force=1）',
         /reload\(true\)/.test(clientSrc) && /`\$\{HUD_URL\}\?force=1`/.test(clientSrc));
 
-      // 10) v1.1.9：失败后**只在后台补一次**。
-      //     真机场景：机器睡醒 / DSH 刚重启时第一次外网连接是冷的，5s 超时被砍，
-      //     卡片落到几小时前的预报，要等下一次页面请求才重试（最多 5 分钟）。
-      setWeatherRetryDelayForTest(30);
-      clearWeatherCache();
-      calls = 0;
-      let failOnce = true;
-      globalThis.fetch = async () => {
-        calls += 1;
-        if (failOnce) { failOnce = false; throw new TypeError('stub: 冷启动超时'); }
-        return okResponse();
-      };
-      await readWeather(LAT, LON).catch(() => {});
-      check('失败后挂上一个补拉待办', weatherStatus().retryPending === true, JSON.stringify(weatherStatus().retryPending));
-      check('失败当下只打了一次网络（补拉不在请求路径上）', calls === 1, `calls=${calls}`);
-      await new Promise((r) => setTimeout(r, 90));
-      check('补拉在后台真的跑了一次并拿到数据', calls === 2 && weatherStatus().cached !== null, `calls=${calls}`);
-      check('补拉成功后待办清空', weatherStatus().retryPending === false);
+      // 10) v1.1.10：补拉、冷却、TTL 都收进 `createWeatherSource`——探针自己建一个通道来验，
+      //     不再改模块级常量（旧的 setWeatherRetryDelayForTest 已删除）。
+      {
+        // A. 第一次失败 → 只打一次网络 + 挂待办 → 补拉成功 → 待办清空
+        let callsA = 0;
+        const srcA = createWeatherSource({
+          retryMs: 20,
+          fetchImpl: async () => {
+            callsA += 1;
+            if (callsA === 1) throw new TypeError('stub: 冷启动超时');
+            return okResponse();
+          },
+        });
+        await srcA.read(LAT, LON).catch(() => {});
+        check('失败后挂上一个补拉待办', srcA.peek().retryPending === true);
+        check('失败当下只打了一次网络（补拉不在请求路径上）', callsA === 1, `calls=${callsA}`);
+        const recovered = await waitFor(() => srcA.peek().cached !== null);
+        check('补拉在后台跑了一次并拿到数据', recovered && callsA === 2, `calls=${callsA}`);
+        check('补拉成功后待办清空', srcA.peek().retryPending === false);
 
-      clearWeatherCache();
-      calls = 0;
-      globalThis.fetch = async () => { calls += 1; throw new TypeError('stub: 一直断'); };
-      await readWeather(LAT, LON).catch(() => {});
-      await new Promise((r) => setTimeout(r, 90));
-      check('补拉也失败时只补一次（1 次原始 + 1 次补拉）', calls === 2, `calls=${calls}`);
-      await new Promise((r) => setTimeout(r, 90));
-      check('补拉失败后不再排下一次（断网时不变成轮询）', calls === 2, `calls=${calls}`);
+        // B. 一直失败 → 1 次原始 + 1 次补拉，之后不再排（断网时不变成轮询）
+        let callsB = 0;
+        const srcB = createWeatherSource({
+          retryMs: 20,
+          fetchImpl: async () => { callsB += 1; throw new TypeError('stub: 一直断'); },
+        });
+        await srcB.read(LAT, LON).catch(() => {});
+        check('补拉也失败时只补一次（1 + 1）', (await waitFor(() => callsB === 2)) && callsB === 2, `calls=${callsB}`);
+        await new Promise((r) => setTimeout(r, 120));
+        check('补拉失败后不再排下一次（断网不变成轮询）', callsB === 2, `calls=${callsB}`);
 
-      clearWeatherCache();
-      calls = 0;
-      setWeatherRetryDelayForTest(60);
-      globalThis.fetch = async () => {
-        calls += 1;
-        if (calls === 1) throw new TypeError('stub: 首个失败');
-        return okResponse();
-      };
-      await readWeather(LAT, LON).catch(() => {});
-      await readWeather(LAT, LON, { force: true }); // 期间手动刷到了新鲜数据
-      const callsAfterFresh = calls;
-      await new Promise((r) => setTimeout(r, 120));
-      check('期间已有新数据 → 到点的补拉直接跳过', calls === callsAfterFresh, `calls=${calls}`);
+        // C. 期间被手动刷到新鲜数据 → 到点的补拉直接跳过（成功即取消待办）
+        let callsC = 0;
+        const srcC = createWeatherSource({
+          retryMs: 60,
+          fetchImpl: async () => {
+            callsC += 1;
+            if (callsC === 1) throw new TypeError('stub: 首个失败');
+            return okResponse();
+          },
+        });
+        await srcC.read(LAT, LON).catch(() => {});
+        await srcC.read(LAT, LON, 'refresh');
+        const callsAfterFresh = callsC;
+        await new Promise((r) => setTimeout(r, 120));
+        check('期间已有新数据 → 到点的补拉直接跳过', callsC === callsAfterFresh, `calls=${callsC}`);
 
-      clearWeatherCache();
-      calls = 0;
-      globalThis.fetch = async () => { calls += 1; throw new TypeError('stub: 断'); };
-      await readWeather(LAT, LON).catch(() => {});
-      check('再次失败仍有待办（用来验证取消）', weatherStatus().retryPending === true);
-      clearWeatherCache();
-      check('clearWeatherCache（换位置）会取消待办', weatherStatus().retryPending === false);
-      await new Promise((r) => setTimeout(r, 90));
-      check('取消后到点也不会再打网络', calls === 1, `calls=${calls}`);
-      setWeatherRetryDelayForTest(25000); // 还原生产值，别影响后面的用例
+        // D. clear()（换位置）取消待办
+        let callsD = 0;
+        const srcD = createWeatherSource({
+          retryMs: 40,
+          fetchImpl: async () => { callsD += 1; throw new TypeError('stub: 断'); },
+        });
+        await srcD.read(LAT, LON).catch(() => {});
+        check('再次失败仍有待办（用来验证取消）', srcD.peek().retryPending === true);
+        srcD.clear();
+        check('clear（换位置）会取消待办', srcD.peek().retryPending === false);
+        await new Promise((r) => setTimeout(r, 120));
+        check('取消后到点也不会再打网络', callsD === 1, `calls=${callsD}`);
+
+        // E. mode='retry' 自己失败时不排补拉（"只补一次"的机制保证）
+        const srcE = createWeatherSource({
+          retryMs: 20,
+          fetchImpl: async () => { throw new TypeError('stub: 断'); },
+        });
+        await srcE.read(LAT, LON, 'retry').catch(() => {});
+        check("mode='retry' 自己失败时不再排补拉", srcE.peek().retryPending === false);
+
+        // F. 生产通道的诊断字段是既有契约
+        const st = weatherStatus();
+        check('weatherDiag 保留 timeoutMs / cooldownMs，并新增 ttlMs / retryMs',
+          st.timeoutMs === 5000 && st.cooldownMs === 120000 && st.ttlMs === 600000 && st.retryMs === 25000,
+          JSON.stringify({ timeoutMs: st.timeoutMs, cooldownMs: st.cooldownMs, ttlMs: st.ttlMs, retryMs: st.retryMs }));
+      }
+
+      // 11) v1.1.10：备注改成「按数据年龄、以小时计」，不再按「上次取数失败」报警。
+      //     客户端逻辑跑在浏览器里（探针起不了 React），这里做静态检查 + 纯函数的边界靠人眼验。
+      check('备注按小时计：1 小时以内不吭声、24 小时换说法',
+        /WEATHER_QUIET_MS = 60 \* 60 \* 1000/.test(clientSrc) && /WEATHER_OLD_MS = 24 \* 60 \* 60 \* 1000/.test(clientSrc),
+        '');
+      check('备注由纯函数 weatherNoteOf() 产出（不再埋在渲染闭包里）', /function weatherNoteOf\(/.test(clientSrc));
+      check('「取不到最新天气」这句按失败报警的旧文案已消失', !clientSrc.includes('取不到最新天气'));
+      check('备注用「小时没更新 / 天前」两种说法', clientSrc.includes('小时没更新') && clientSrc.includes('天前的'));
+
+      const indexSrc = readFileSync(join(REPO, 'plugin', 'index.js'), 'utf8');
+      check('Host 侧有天气定时暖缓存（weatherPollMs，默认 30 分钟）',
+        /weatherPollMs/.test(indexSrc) && /30 \* 60 \* 1000/.test(indexSrc) && /lifehud: weather poll/.test(indexSrc));
+      check('定时器可整体关掉（weatherPollMs: 0）', /if \(!\(pollMs > 0\)\)/.test(indexSrc));
+      // v1.1.10 真机踩到：定时器里用了 readWeather 却忘了 import，异常被空 catch 吞掉，
+      // 于是「定时器在跑、永远不会取数」，盯了 90 秒才发现。这条守住接线。
+      check('定时器真的接上了 readWeather（漏 import 会被 catch 吞成静默）',
+        /import \{[^}]*\breadWeather\b[^}]*\} from '\.\/lib\/hud\.js'/.test(indexSrc));
     } finally {
       globalThis.fetch = realFetch;
       Date.now = realNow;
