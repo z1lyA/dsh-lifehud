@@ -1,7 +1,7 @@
 # AGENTS.md — dsh-lifehud 协作手册
 
 > 给接手的 AI：读这一份就能继续开发。**只写长期稳定的事实**，版本细节写 `spike/RESULT.md`。
-> 最后更新：2026-11-20 ｜ 插件版本：1.1.9
+> 最后更新：2026-11-20 ｜ 插件版本：1.1.10
 
 ---
 
@@ -12,7 +12,7 @@
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
 | 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性 52 项）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-countdown.mjs`（倒计时状态机 31 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 53 项）／`node spike/probe-inbox.mjs [http://127.0.0.1:<DSH 端口>]`（收件箱写入 38 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性 60 项）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-countdown.mjs`（倒计时状态机 31 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 53 项）／`node spike/probe-inbox.mjs [http://127.0.0.1:<DSH 端口>]`（收件箱写入 38 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
 | 小米云会话过期了 | `node notes/tools/mi-login.mjs`：扫码/链接确认重登，自动写回 `mi-session.json`（**本地脚本，未随仓库发布**）。备份依赖：`mi-login-qr.png`。细节见 `docs/小米云取数.md` §4 |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
@@ -65,7 +65,7 @@ plugin/            ← 唯一会被 DSH 加载的东西
   package.json     dsh.bundle / dsh.client / exports / files
   cordis.patch.yml Host 行的 config（默认值都在代码里推导，这里通常不用改）
   index.js         Host 入口：apply / 路由注册 + 对 lib 的再导出
-  lib/             Host 实现：capture（采集/迁移）、activity（专注聚合）、weight、update、hud、settings、util
+  lib/             Host 实现：capture（采集/迁移）、activity（专注聚合）、weight、weather（天气通道）、update、hud、settings、util、inbox（收件箱写入）
   client.js        浏览器：设置、卡片、渲染
   collector.ps1    专注采集器：长驻 PowerShell 子进程，每 N 秒输出一行 JSON
 spike/             探查脚本与结论（probe-*.mjs、paths.mjs、RESULT.md）
@@ -103,11 +103,11 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 ## 6. 坑（踩过的）
 
-- **天气不可达时，别让整页陪它等超时**（2026-11-15）：`readWeather()` 原来是「超时 6s + 失败不重试」，于是天气一断，**每一次** `/hud` 都要 6.02s（实测四连），任务/会话/专注/热力全跟着慢——用户体感就是「重启后 LifeHud 加载变慢」。现在：**超时 5s**（2026-11-17 从 3s 调回：同链路实测耗时 0.27/0.33/0.48/**2.04/2.75** 秒，3s 只比长尾多 0.25s，太贴边，会把本来能成的请求判成超时）+ **失败后 2 分钟冷却**（冷却期内直接返回上次的值或 null，毫秒返回，不再打网络）+ **并发单飞**（N 个并发只打一次）；另外**上次成功的天气会落盘到 `<dataDir>/weather-cache.json`**（原来只在内存，一重启就没了 —— 于是断线 + 重启 = 既没新数据也没旧数据可兜底，卡片只能干说「取不到」）。回归用例：`probe-hud.mjs` 最后那组 10 条（含 Date.now 快进验证冷却到期会重试、stub fetch 验单飞）。**判活口径**：`/hud` 的 `weatherDiag` 字段——字段在＝新代码生效，缺失＝进程里还是旧 `hud.js`（见上一条）。天气卡底部会显示数据新旧（「取不到最新的 · 显示的是 12:47 的数据」），设置页诊断区另有一行。
+- **天气不可达时，别让整页陪它等超时**（2026-11-15）：`readWeather()` 原来是「超时 6s + 失败不重试」，于是天气一断，**每一次** `/hud` 都要 6.02s（实测四连），任务/会话/专注/热力全跟着慢——用户体感就是「重启后 LifeHud 加载变慢」。现在：**超时 5s**（2026-11-17 从 3s 调回：同链路实测耗时 0.27/0.33/0.48/**2.04/2.75** 秒，3s 只比长尾多 0.25s，太贴边，会把本来能成的请求判成超时）+ **失败后 2 分钟冷却**（冷却期内直接返回上次的值或 null，毫秒返回，不再打网络）+ **并发单飞**（N 个并发只打一次）；另外**上次成功的天气会落盘到 `<dataDir>/weather-cache.json`**（原来只在内存，一重启就没了 —— 于是断线 + 重启 = 既没新数据也没旧数据可兜底，卡片只能干说「取不到」）。回归用例：`probe-hud.mjs` 天气那几组（第 2–11 组：超时 / 冷却 / 到期重试 / 单飞 / 当前小时 / refresh / 补拉 / 备注阈值）。**判活口径**：`/hud` 的 `weatherDiag` 字段——字段在＝新代码生效，缺失＝进程里还是旧 `hud.js`。卡片上的时效备注从 v1.1.10 起贴在大温度下方、按**小时**计（< 1 小时不显示），设置页诊断区另有一行。
 - **缓存里的「当前小时」必须按请求时刻重算**（2026-11-18）：天气 payload 是整包缓存的，`nowIndex`/`now`/`nowText` 是**取数那一刻**算好的。断线几小时后直接渲染，卡片会冻在取数时的小时上——真机踩到过「13:22 还显示 09:00 的 22.4℃」。现在 `buildHud` 出口统一过一遍 `refreshCurrentHour()`，按「今天 + 当前小时」重新定位当前点。回归用例：`probe-hud.mjs` 的「当前小时按请求时刻重算」。
 - **倒计时的计时器和提醒都必须活在 Host**（2026-11-19）：用户会切去对话——那一刻 LifeHud 的 React 组件被**卸载**，纯前端 `setInterval` 连同提醒一起消失。所以计时器在 `lib/countdown.js`（1 秒 tick，状态落盘 `<dataDir>/countdown.json`），到点用 **Windows PowerShell 5.1 + WinRT toast** 发系统通知。两个坑：① 中文文案必须走 **`-EncodedCommand`**（UTF-16LE base64）——写 `.ps1` 文件或直接塞进命令行都会乱码（PS 5.1 按 ANSI 读）；② 通知**入系统库有 1–3 秒延迟**，`wpndatabase.db` 里查不到不代表没发出去。AppID 用 `com.deepseek.dsh`（零配置，通知里显示 DeepSeek Harness）。**第三个坑（2026-11-19 实测）**：`spawn` 绝对不能带 `detached: true`——四组对照里只有「不 detached」的两组真正进了系统，带 detached 的退出码 0 但 toast 静默丢失。现在固定 `stdio: ['ignore','ignore','pipe']` 并把 stderr 收进 `notifyLast`（`/lifehud/api/countdown` 里能看到 `{at, code, err}`），出问题不用猜。验证：`spike/probe-countdown.mjs`（31 项，注入假 notifier 断言文案与"只发一次"）。
 - **「天气备注有滞后性」的真相 = 冷却挡住了刷新，不是备注算错**（2026-11-20，v1.1.8 修）：用户看到「数据明明更新了，卡片还写着『数据取于 00:28（10 小时前）』」。查下来是两件事叠在一起——① 卡片上的温度是**按当前小时从这份预报里重新挑的**（`refreshCurrentHour`），小时一过数字就变，看起来像「刚更新过」；② 那次真的是 10 小时没取到（机器睡了一夜，第一条请求撞上 5s 超时），而工具条「刷新」以前**不带 force**，落在 2 分钟冷却里只会原样返回旧值，于是「点刷新也没用」。现在：`/hud?force=1` 让 `readWeather` 跳过 TTL **和**冷却（单飞仍然生效），「刷新」按钮走这条；备注也从卡片右下角挪到**大温度正下方**、措辞改成「这份预报取于 HH:mm（X 前）」。回归用例：`probe-hud.mjs` 第 9 组（force 跳冷却 / 跳 TTL / 仍旧单飞 / 页面确实传了 force）。
-- **天气是「按需取数」，没有后台定时器**（2026-11-20 用户问「为什么两小时没更新」时确认）：`/hud` 每被请求一次才有机会取一次；页面开着时 Client 每 5 分钟问一次，Host 侧 10 分钟 TTL 内直接复用 → **有效刷新间隔约 10 分钟**；页面不在（切去对话＝组件卸载 / 窗口最小化＝`document.hidden` / DSH 关掉）就**一次也不取**。所以「几小时前的预报」通常不是"一直在失败"，而是"这几个小时没人问过"。注释卡片上那句「取于 HH:mm」说的就是**最后一次成功**的时刻。体重不一样：它有 Host 侧 10 分钟定时器，页面关着也同步。**v1.1.9 起失败后会在 Host 侧补拉一次**（25s 后，`scheduleRetry:false` 保证只补一次、不变成轮询；`clearWeatherCache()` 会取消待办；`weatherDiag.retryPending` 可观测）——这条补拉在 Host，页面关着也会跑。
+- **天气「按需取数」→ 有定时器了**（2026-11-20，v1.1.9 补拉、v1.1.10 定时）：v1.1.9 之前页面关着就**一次也不取**（`/hud` 请求才有机会取），于是「几小时前的预报」通常不是"一直在失败"，而是"这几个小时没人问过"。现在两层：① **Host 侧 30 分钟定时暖缓存**（`weatherPollMs`，与体重同一个 `ctx.effect` 写法，`0` 可关；每次 tick 重读设置，所以改位置不用重启）；② **失败后 25 秒后台补拉一次**（`mode:'retry'` —— 强制但不再排下一次，断网时不变成轮询；`clearWeatherCache()` 会取消待办；`weatherDiag.retryPending` 可观测）。页面侧仍然是每 5 分钟 `/hud`（可见才发）。
 - **「连续最长」不等于「单个窗口事件」**（2026-11-20，v1.1.8 改口径）：老口径取**单个事件**里扣掉 AFK 后最长的那个，于是「连续看了 27 分钟 B 站」被换视频切断，卡片只报 10 分钟，用户直接看不懂。现在 `lib/activity.js` 把**同一应用相邻出现**的段合并（`FOCUS_RUN_GAP_MS=60s`，切走一分钟内不算断），秒数仍然扣 AFK（与 top / tracking 同口径），卡片文案改成「连续最长」。**别改回按事件**，也别为了数字好看把 AFK 去掉——那会让「开着窗口去吃饭」变成最长段。
 - **但 remove → install 也不保证重新 import `plugin/lib/*.js`**（2026-11-15 实测）：Cordis 确实重新 apply 了入口，Node 的 ESM 缓存却按 URL 命中，**已经求值过的 `lib/*.js` 不会再跑一遍**。症状：`install_bundle` 返回 `changed:true`、`version` 也是新的，但 `/hud` 的 `version` 还是旧值、新加副作用不出现（当时删掉 `meta.miDeviceId` 再 `?force=1`，新代码会立刻重写它，结果没写 → 证明跑的仍是旧 `weight.js`）。**判别法**：找一个「只有新代码才会做」的副作用去验，或直接看 `/hud` 的 `version`；别拿 install 的返回值当生效证据。**真要让 Host 改动生效：重启 DSH**（重启后本会话可恢复）。
   **2026-11-20 补充（v1.1.8 实测）**：这次 remove → install 之后 `hud.js` / `activity.js` / `index.js` / `inbox.js` 的新代码**确实生效了**（`/hud` 多出 `tasks.inboxCount`、`GET /inbox` 回 405 而不是 404），唯独 `update.js` 里那个「模块加载时读一次」的 `PLUGIN_VERSION` 还是旧值——说明重装大概率是**按文件重新求值**（没改动的文件继续吃旧模块）。两条结论：① 判活永远找一个「只有新代码才会做」的副作用，别信 install 的返回值；② **别把可观测状态缓存在模块顶层**，版本号就是活例子（v1.1.8 起 `pluginVersion()` 每次读 package.json）。
@@ -151,7 +151,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - ✅ HUD 自动刷新（v1.1.1）：Client `useHud()` 每 5 分钟静默重取一次（页面隐藏时不发请求，`visibilitychange` 回页面补一次；三道护栏防并发：hidden / `prefetch` 在飞 / `HUD_TTL` 未过期都跳过）。
 - ✅ 体重同步：Host 每 10 分钟自动拉一次小米云（定时器可 dispose）；页面「刷新」按钮带 `?force=1` 立即拉，**这是"刚踩秤就能看到"的主路径**。
 - ✅ 体重健壮性（v1.1.3）：会话过期不再被误报成「云端异常」（426/SERVICETOKEN_EXPIRED → `session-expired`，卡片提示「请重新登录」）；设备指纹改成持久固定（见 §6），避免被小米风控当成盗号而提前掐会话。
-- ✅ 天气健壮性（v1.1.4 / v1.1.5 / **v1.1.8 / v1.1.9**）：单次取值超时 5s、失败后 2 分钟冷却、并发单飞、**上次成功的天气落盘兜底**、**当前小时按请求时刻重算**（见 §6）。天气不可达时 `/hud` 毫秒返回；有落盘数据时天气卡显示上次的天气 + 一句「取不到最新天气 · 这份预报取于 HH:mm（X 前）」（**v1.1.8 起这行在大温度正下方**，不再缩在卡片右下角），没有数据才显示「取不到」。**「刷新」带 `?force=1`**：跳过 TTL 与冷却、老老实实打一次（冷却期内点刷新不再拿回旧值）。**v1.1.9 起失败后会在 Host 侧补拉一次**（25s 后，只一次、不在请求路径上；见 §6「按需取数」）。`/hud` 暴露 `weatherDiag`（缓存/失败/超时/冷却/补拉待办的生效值），设置页诊断区另有一行中文状态，也用来判断进程里跑的是哪一版代码。
+- ✅ 天气（v1.1.4 / v1.1.5 / v1.1.8 / v1.1.9 / **v1.1.10**）：取数逻辑收在 `lib/weather.js` 的 `createWeatherSource()`（TTL 10 分钟 · 超时 5s · 失败冷却 2 分钟 · 并发单飞 · 落盘兜底 · 失败后 25s 补一次），`readWeather(lat, lon, mode)` 只是它的薄壳，`mode` = `cached` / `refresh` / `retry`（取代原来的 `{force}`）。**Host 每 30 分钟定时暖缓存**（`weatherPollMs`，0 可关），所以关着页面也是新的。卡片备注**按数据年龄**说话：< 1 小时不显示；1–23 小时「预报已 N 小时没更新 · 取自 HH:mm」；≥ 24 小时「预报是 N 天前的」（提亮）；失败信息只进 tooltip。`/hud` 暴露 `weatherDiag`（缓存/失败/超时/冷却/TTL/补拉待办），设置页诊断区另有一行。
 - ✅ v1.1.8 的三处增量：**任务卡「+」→ 收件箱录入**（`POST /inbox`，唯一写外部库的路径，卡片底部显示「NowTree 收件箱 N 条」当下落反馈）、**体重卡均值虚线**（7 个测量日的算术平均，HUD 接口新增 `average`）、**专注卡改「连续最长」**（见 §6）。
 - ✅ 检查更新（v1.1.2）：页面「设置 → 版本与更新」手动点才联网（**不做启动自动检查**）；Host 读 GitHub Release/Tag，取最大语义版本，有 Release 就显示发布日期与正文；`/hud` 新增 `version` 字段（Host 版本），页面拿它和 `BUILD` 对比提示「页面资源旧了」；上次结果存 localStorage（键 `lifehud.update.v1`，版本变了自动作废，只回显不发请求）。
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
@@ -178,7 +178,7 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
 - **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]` + `idle` 四档 0，卡片显示「还没有采集到数据」，HUD 其余部分照常。
 - **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, writes, pending, restarts, noise, pollSeconds, lastSampleAt, lastError, warnings[]}`（`writes` 是 INSERT+UPDATE 的写入次数，不是库内行数；v1.1.2 从 `rows` 改名）。采集器 stderr 只在进程退出时随详情进 `warnings`，另有退出码与迁移失败。这些字段只走 `/hud` 接口与探针；设置里的诊断区目前只渲染 `warnings` 文本，**不渲染 `capture.*`**。
 - **改它的入口**：`plugin/collector.ps1`（采样）、`lib/capture.js`（合并/落盘/迁移）、`lib/activity.js`（聚合）、`lib/hud.js`（组装）。
-- **验证**：`node spike/probe-hud.mjs`（确定性 52 项，末组是天气超时/冷却/单飞/force）、`node spike/probe-hud.mjs --real`（真实采集库）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP；它的 A18/A19/B1 依赖「本机 AW 已停」这个前提，AW 又被启动时会红，与代码无关）。
+- **验证**：`node spike/probe-hud.mjs`（确定性 60 项，末组是天气超时/冷却/单飞/force）、`node spike/probe-hud.mjs --real`（真实采集库）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP；它的 A18/A19/B1 依赖「本机 AW 已停」这个前提，AW 又被启动时会红，与代码无关）。
 
 ### 体重卡怎么工作（v1.1.0，重要）
 

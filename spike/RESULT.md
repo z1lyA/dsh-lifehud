@@ -421,6 +421,27 @@ AFK 区间不精确切分到事件内部，按占比摊到整段——**热力�
 
 **仍然没解决 / 边界**：① 页面关着时**首次打开仍可能撞一次冷启动超时**（补拉会在 25s 后自愈，但那 25s 内卡片还是旧预报）；② 补拉成功也不会主动推给已打开的页面，最迟要等下一次 `/hud`（≤5 分钟）才看到新数据；③ 「按需取数」本身没改——想要"没人看也保持新鲜"需要另加 Host 定时器（用户这次选择不加）。
 
+---
+
+## v1.1.10：天气卡按 code-review 重做（2026-11-20 下午）
+
+用户拿 `v1.1.7...HEAD` 跑了两轴 review（Standards / Spec，各一个子代理），结论落在三处，逐条改：
+
+1. **备注的触发条件错了**：以前 `weatherStale = Boolean(weatherDiag.failed)`——任意一次 5s 超时就报「取不到最新天气（N 分钟前）」。天气是预报，十几分钟前的照样能用，报一次只会让人对提示脱敏（用户原话：「十几分钟没取到…应该以小时为单位」）。改成**只看数据年龄**的纯函数 `weatherNoteOf()`：< 1 小时不显示；1–23 小时「预报已 N 小时没更新 · 取自 HH:mm」；≥ 24 小时「预报是 N 天前的」（提亮）；失败信息只进 tooltip。
+2. **补一个 Host 侧定时器**：和体重同一套 `ctx.effect` + `setInterval`，默认 **30 分钟**（`weatherPollMs: 0` 可关；每次 tick 重读设置，改位置不用重启）。这也回答了「能不能和体重卡一起定时」——能，而且几乎免费（体重本来就在每 10 分钟醒一次）。
+3. **结构重构**（review 的 Divergent Change / Primitive Obsession / Speculative Generality）：
+   - 天气取数整段从 `hud.js` 搬到新的 `lib/weather.js`：`createWeatherSource({storePath, ttlMs, timeoutMs, cooldownMs, retryMs, now, fetchImpl, setTimeout})` → `{read, peek, clear, setStore}`。六个模块级单例（缓存/失败/在飞/补拉/落盘路径/落盘已读）收进闭包；`hud.js` 只剩 `readWeather / weatherStatus / clearWeatherCache` 三个薄壳。
+   - `{force, scheduleRetry}` 两个并排布尔换成 `mode: 'cached' | 'refresh' | 'retry'`，路由 / `buildHud` / 客户端说同一个词。
+   - **`setWeatherRetryDelayForTest()` 删掉**：补拉延迟现在从构造参数来，探针直接 `createWeatherSource({ retryMs: 20 })` 自建通道，不再改模块级状态、也不再导出测试钩子。
+   - 客户端 `weatherNoteOf()` 抽成模块级纯函数（照 `updateStatusText()` 的先例）。
+   - 顺手修了 review 指出的护栏漏洞：`force` 不登记 `prefetch`，手动刷新在飞时定时器会判空通过再起一次 `/hud`；现在用 `hudInFlight` 计数，任何请求在飞都跳过。
+   - 探针不再用 `setTimeout(90)` 硬等：改成 `waitFor(predicate)` 轮询（Windows 计时粒度 15.6ms，负载下固定 sleep 会 flaky）。
+
+**验证**：`probe-hud` **60/60**（新增：补拉只补一次 / 补拉失败不再排 / 有新数据就跳过 / clear 取消待办 / `mode:'retry'` 不自我排队 / `weatherDiag` 字段契约 / 备注阈值与「旧文案已消失」的静态检查 / Host 定时器与 `weatherPollMs: 0` 开关）。
+
+**未覆盖**：`weatherNoteOf()` 的边界（59/60/61 分钟、23/24/25 小时）靠的是静态检查 + 人眼，没有在浏览器里跑（客户端逻辑需要 React 运行时）；视觉上「1 小时静音」是否真的舒服，要等真机看一两天。
+
+
 
 
 
