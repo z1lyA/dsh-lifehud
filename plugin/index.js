@@ -402,7 +402,7 @@ export {
   countdownCancel, disposeCountdown, setCountdownNotifier, shiftCountdownForTest,
   tickCountdownForTest, resetCountdownForTest, COUNTDOWN_MAX_MS,
 } from './lib/countdown.js';
-export { buildHud, readWeather, clearWeatherCache, weatherStatus } from './lib/hud.js';
+export { buildHud, readWeather, clearWeatherCache, weatherStatus, setWeatherRetryDelayForTest } from './lib/hud.js';
 export {
   parseVersion, compareVersion, summarizeUpdate, readUpdate, UPDATE_REASON_CODES,
 } from './lib/update.js';

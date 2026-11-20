@@ -281,6 +281,47 @@ function storeWeather(entry) {
 const staleWeather = (key) => (weatherCache && weatherCache.key === key ? weatherCache.value : null);
 
 /**
+ * 失败后的**一次性**后台补拉（v1.1.9）。
+ *
+ * 为什么要它：机器睡了一觉 / DSH 刚重启时，进程里的**第一次**外网连接常常是冷的
+ * （DNS、TLS 会话、代理隧道都要现建），5 秒超时刚好把它切断。2026-11-20 实测：
+ * 同一分钟里 PowerShell 0.4s、独立 node 0.3–1.9s 都能取到，只有 Host 那道 5s 超时被砍；
+ * 于是卡片落到磁盘上几小时前的预报，要等下一次页面请求（最多 5 分钟）才重试。
+ *
+ * 三条纪律：
+ *   1. **只补一次**：补拉自己失败时不再排下一次（`scheduleRetry: false`），
+ *      否则断网时会变成每 25 秒一次的轮询——那正是失败冷却想避免的事；
+ *   2. **在后台**：不在 `/hud` 的请求路径上，谁也不用陪它等，首屏延迟不变；
+ *   3. **幂等**：同一坐标只挂一个待办；期间已有新数据就跳过；`clearWeatherCache()` 顺手取消。
+ */
+const WEATHER_RETRY_MS = 25 * 1000;
+/** @type {{key:string,timer:ReturnType<typeof setTimeout>}|null} */
+let weatherRetry = null;
+/** 探针可以把它改小（生产恒为 WEATHER_RETRY_MS）。 */
+let weatherRetryDelayMs = WEATHER_RETRY_MS;
+
+function cancelWeatherRetry() {
+  if (!weatherRetry) return;
+  clearTimeout(weatherRetry.timer);
+  weatherRetry = null;
+}
+
+/** @param {string} key @param {number} lat @param {number} lon */
+function scheduleWeatherRetry(key, lat, lon) {
+  if (weatherRetry && weatherRetry.key === key) return; // 同一坐标已有待办
+  cancelWeatherRetry();
+  const timer = setTimeout(() => {
+    weatherRetry = null;
+    // 这期间已经被别的请求取到新鲜的了 → 没必要再打
+    if (weatherCache && weatherCache.key === key && Date.now() - weatherCache.at < WEATHER_TTL_MS) return;
+    void readWeather(lat, lon, { force: true, scheduleRetry: false }).catch(() => {});
+  }, weatherRetryDelayMs);
+  // 别让这个定时器把进程吊着（DSH 退出 / 探针结束时立即干净）
+  if (typeof timer.unref === 'function') timer.unref();
+  weatherRetry = { key, timer };
+}
+
+/**
  * Cached weather so re-opening the page never waits on the network.
  *
  * 两层保护（2026-11-15 加）：天气服务不可达时，`/hud` 是整页首屏，
@@ -293,7 +334,8 @@ const staleWeather = (key) => (weatherCache && weatherCache.key === key ? weathe
  * 于是数据明明能取到、卡片却还写着「取不到最新天气」——用户点一次就该知道到底通不通。
  * 单飞仍然生效（force 也不例外）：N 个并发的强制刷新只打一次网络。
  * @param {number} lat @param {number} lon
- * @param {{force?:boolean}} [options] force 跳过 TTL 与失败冷却
+ * @param {{force?:boolean,scheduleRetry?:boolean}} [options]
+ *   force 跳过 TTL 与失败冷却；scheduleRetry=false 表示这次失败不再排后台补拉（补拉自己用）
  * @returns {Promise<object|null>} weather
  */
 export async function readWeather(lat, lon, options = {}) {
@@ -313,6 +355,7 @@ export async function readWeather(lat, lon, options = {}) {
       const value = await fetchWeather(lat, lon);
       weatherCache = { key, at: Date.now(), value };
       weatherFail = null;
+      cancelWeatherRetry(); // 已经有新数据了，别再补
       storeWeather(weatherCache);
       return value;
     } catch (error) {
@@ -321,6 +364,7 @@ export async function readWeather(lat, lon, options = {}) {
         at: Date.now(),
         message: error instanceof Error ? error.message : String(error),
       };
+      if (options.scheduleRetry !== false) scheduleWeatherRetry(key, lat, lon);
       throw error;
     }
   })();
@@ -338,9 +382,21 @@ export function weatherStatus() {
     cached: weatherCache ? { key: weatherCache.key, at: weatherCache.at } : null,
     failed: weatherFail ? { key: weatherFail.key, at: weatherFail.at, message: weatherFail.message } : null,
     inflight: Boolean(weatherInflight),
+    /** 有没有挂着一个「失败后补一次」的待办（v1.1.9，诊断用）。 */
+    retryPending: Boolean(weatherRetry),
+    retryMs: weatherRetryDelayMs,
     cooldownMs: WEATHER_FAIL_COOLDOWN_MS,
     timeoutMs: WEATHER_TIMEOUT_MS,
   };
+}
+
+/**
+ * 探针专用：把「失败后补一次」的延迟改小，好在毫秒级验证它。
+ * 生产路径永远用默认的 25 秒（没有配置项，免得变成一个可调出来的轮询）。
+ * @param {number} ms
+ */
+export function setWeatherRetryDelayForTest(ms) {
+  weatherRetryDelayMs = Math.max(1, Number(ms) || WEATHER_RETRY_MS);
 }
 
 /**
@@ -503,4 +559,8 @@ export async function buildHud(config = {}, runtime = {}, options = {}) {
   };
 }
 /** 位置变了 / 设置更新后让天气下次重新拉。 */
-export function clearWeatherCache() { weatherCache = null; weatherFail = null; }
+export function clearWeatherCache() {
+  weatherCache = null;
+  weatherFail = null;
+  cancelWeatherRetry(); // 换位置后别让旧坐标的补拉继续打
+}
