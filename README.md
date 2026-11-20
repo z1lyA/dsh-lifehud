@@ -2,21 +2,21 @@
 
 > **抬头（LifeHud）** —— 长在 DeepSeek Harness 里的个人工作台：一屏看完今天该干什么、外面什么情况、我昨天停在哪里。
 
-**v1.1.7** · 零依赖 · 单个 DSH 插件 · 不改动任何被读取的应用（专注数据由自己采集，见下）
+**v1.1.8** · 零依赖 · 单个 DSH 插件 · 只读聚合别人的数据（唯一例外：任务卡的「+」会往 NowTree 的 Inbox 追加一条，见下）
 
 ## 装什么、读什么
 
-LifeHud 自己**几乎不产生数据**：只有「专注 / 热力」是它自己采的（本机 Windows API → 自己的 SQLite），其余全是只读聚合：
+LifeHud 自己**几乎不产生数据**：只有「专注 / 热力」是它自己采的（本机 Windows API → 自己的 SQLite），其余全是聚合：
 
 | 卡片 | 数据来源 | 读法 |
 |---|---|---|
-| 当前时段任务 | [NowTree](https://github.com/z1lyA/NowTree) 的 `nowtree.sqlite` | `node:sqlite` 只读打开，按 `time_slot` 过滤 |
-| 天气 | Open-Meteo（无需 key） | 48 小时逐时数据，可跨午夜 |
+| 当前时段任务 | [NowTree](https://github.com/z1lyA/NowTree) 的 `nowtree.sqlite` | `node:sqlite` 只读打开，按 `time_slot` 过滤；右上角「+」（v1.1.8）会**只追加**一条 Inbox 记录 |
+| 天气 | Open-Meteo（无需 key） | 48 小时逐时数据，可跨午夜；取不到时显示上次成功的预报并标清取数时刻，「刷新」会强制重试 |
 | 最近会话 | DSH 的 `session_projcache` | 读 json；已删除的会话（无日志目录）不显示 |
-| 专注（v1.1.1） | **本机自采集**：`plugin/collector.ps1` 每 2 秒读前台窗口与空闲时间 | 减掉 AFK 区间，按应用聚合最近 24 小时，并显示最长一段；空闲强度按四档另存（v1.1.2，页面暂未展示） |
+| 专注（v1.1.1） | **本机自采集**：`plugin/collector.ps1` 每 2 秒读前台窗口与空闲时间 | 减掉 AFK 区间，按应用聚合最近 24 小时，并显示「连续最长」的一段（v1.1.8 起同一应用切走 1 分钟内不断段）；空闲强度按四档另存（v1.1.2，页面暂未展示） |
 | 热力日历 | 同一份本地采集库 `<dataDir>/capture.db` | 当月每日活跃分钟，分位数分档 |
 | 倒计时（v1.1.6） | 无外部数据源：状态写 `<dataDir>/countdown.json` | 单个 · 一段时长（≤24 小时）· **计时器在 Host 侧**，到点弹 Windows 系统通知（页面切走也照弹） |
-| 体重（v1.1.0） | 小米云 `user/get_user_device_data`（MX80 体脂秤） | 只读拉取，落地到自己的 SQLite 镜像；画最近有数据的 7 个测量日（纵轴刻度 + 悬停看某天数值） |
+| 体重（v1.1.0） | 小米云 `user/get_user_device_data`（MX80 体脂秤） | 只读拉取，落地到自己的 SQLite 镜像；画最近有数据的 7 个测量日（纵轴刻度 + 悬停看某天数值 + v1.1.8 的均值虚线） |
 
 体重卡的取数细节（RC4 签名、会话过期后怎么重新登录）见 [`docs/小米云取数.md`](docs/小米云取数.md)。
 
@@ -59,7 +59,8 @@ plugin_manager({ action: 'install_bundle', target: '<本仓库路径>/plugin' })
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
-| `nowtreeDb` | `%APPDATA%\com.nowtree.app\nowtree.sqlite` | NowTree 的任务库（只读） |
+| `nowtreeDb` | `%APPDATA%\com.nowtree.app\nowtree.sqlite` | NowTree 的任务库（读；「+」录入时**只追加**） |
+| `nowtreeWrite` | `true` | 允许任务卡「+」往 NowTree 的 Inbox 追加记录；设 `false` 就完全不给写 |
 | `leveldbDir` | `%LOCALAPPDATA%\com.nowtree.app\EBWebView\Default\Local Storage\leveldb` | NowTree 的早/午/晚分界（只读） |
 | `dataDir` | `~/.dsh/lifehud` | LifeHud 自己的可写状态（设置、倒计时、天气缓存、体重镜像库） |
 | `weightDb` | `<dataDir>/lifehud-weight.db` | 体重镜像库（只读云、只写本地） |
@@ -81,7 +82,8 @@ plugin_manager({ action: 'install_bundle', target: '<本仓库路径>/plugin' })
 ## 安全边界
 
 - 所有 HTTP 路由**只接受 loopback**（`127.0.0.1` / `::1`）——DSH 不会给插件路由加鉴权，这层必须自己做。
-- **不写任何外部数据源**：NowTree / DSH 会话 / 小米云全部只读；ActivityWatch 只在**首次迁移**时读一次库文件，运行期零依赖。LifeHud 自己的可写状态只在 `dataDir`（体重镜像库 + 专注采集库 `capture.db`）。
+- **只读聚合，唯一例外是 NowTree 的 Inbox 录入（v1.1.8）**：DSH 会话 / 小米云 / ActivityWatch 全部只读；ActivityWatch 只在**首次迁移**时读一次库文件，运行期零依赖。任务卡的「+」会往 `nowtree.sqlite` **INSERT 一行**（`status='inbox'`、`category=NULL`、`time_slot='none'`），**从不 UPDATE / DELETE**，也不碰任何已有记录；写入前校验标题/备注长度，失败就整笔放弃（`BEGIN IMMEDIATE` + 回滚），并在页面显示原因。不想要这个能力就把 `nowtreeWrite` 设成 `false`。
+- LifeHud 自己的可写状态只在 `dataDir`：设置、倒计时状态 `countdown.json`、天气兜底 `weather-cache.json`、体重镜像库、专注采集库 `capture.db`。
 - **专注采集不越界**：只读 Windows 的前台窗口进程名/标题和键鼠空闲时间；不采键鼠具体输入、不采屏幕内容、不采浏览器 URL，也不联网。
 - 小米云会话文件**只读**，不进 git、不进日志、不打印明文；不自动登录、不保存小米密码。
 - 设备号不写死：插件从账号设备列表里自动发现体脂秤，配置里不需要出现任何人的设备 id。
@@ -100,7 +102,7 @@ AGENTS.md      给接手 AI 的协作手册（含所有踩过的坑）
 
 - 小米云那段取数走的是**非公开接口**（从米家插件里逆出来的），不是官方 API，随时可能改或失效；
   仅供**个人备份自己的数据**，用之前想清楚小米的服务条款。项目不提供自动登录、不保存你的密码。
-- 其余数据源（NowTree / DSH 会话 / 小米云）全部**只读**，本插件从不写它们；ActivityWatch 只在首次迁移时读一次库文件。
+- 其余数据源（NowTree / DSH 会话 / 小米云）默认**只读**，本插件从不改动它们的既有内容；ActivityWatch 只在首次迁移时读一次库文件。唯一的写入是你主动点任务卡「+」时往 NowTree 的 Inbox **追加**一条（可用 `nowtreeWrite: false` 关掉）。
 
 ## 已知限制
 
@@ -113,6 +115,8 @@ AGENTS.md      给接手 AI 的协作手册（含所有踩过的坑）
 - **检查更新只在手动点按钮时联网**（这是刻意的：不想让页面加载时替你发请求）；GitHub 未登录限流 60 次/小时，限流时会显示提示并沿用上次结果。插件是 `link:` 安装，所以升级要 `git pull` + 重装，没有「点一下自动更新」。
 - 小米云会话过期后要**手动重新登录一次**才能续上（卡片会红字提示，历史数据不丢）——步骤见 [`docs/小米云取数.md`](docs/小米云取数.md)。
 - 布局是 flex 便当盒：第一行 天气 / 体重 / 任务，第二行 专注 / 会话 / 倒计时 / 热力，不做瀑布流。
+- NowTree 的 Inbox 录入是**直接写它的库**：NowTree 自己的界面可能要切一下页/重开才会显示新记录（它不会监听外部写入）。
+- 「连续最长」扣掉的是**AFK**（≥180 秒没有键鼠输入就算离开）。看视频不属于键鼠输入，所以「看了 30 分钟视频」仍可能只算十几分钟——这是采样口径的固有边界，不是 bug。
 
 ## 许可
 

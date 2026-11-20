@@ -1,7 +1,7 @@
 # AGENTS.md — dsh-lifehud 协作手册
 
 > 给接手的 AI：读这一份就能继续开发。**只写长期稳定的事实**，版本细节写 `spike/RESULT.md`。
-> 最后更新：2026-11-19 ｜ 插件版本：1.1.7
+> 最后更新：2026-11-20 ｜ 插件版本：1.1.8
 
 ---
 
@@ -12,7 +12,7 @@
 | 改 Host（`plugin/index.js`） | 改完 **`plugin_manager` remove_bundle → install_bundle**（不重载等于没改），再 `curl` 一下路由验证 |
 | 改 Client（`plugin/client.js`） | 改完 `node --check plugin/client.js`，然后**刷新页面**（Ctrl+R），不用重装 |
 | 改采集器（`plugin/collector.ps1`） | 它是 Host spawn 的长驻 PowerShell 子进程；改完同样 remove → install（Host 会重启它），再 `node spike/probe-capture.mjs` |
-| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-countdown.mjs`（倒计时状态机 31 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 48 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
+| 验证 Host 逻辑（不碰浏览器） | `node spike/probe-hud.mjs`（聚合卡，确定性 42 项）／`node spike/probe-hud.mjs --real`（真实采集库）／`node spike/probe-capture.mjs`（采集器 50 项）／`node spike/probe-countdown.mjs`（倒计时状态机 31 项）／`node spike/probe-weight.mjs [http://127.0.0.1:<DSH 端口>]`（体重链路 53 项）／`node spike/probe-inbox.mjs [http://127.0.0.1:<DSH 端口>]`（收件箱写入 38 项）／`node spike/probe-update.mjs [http://127.0.0.1:<DSH 端口>] [--live]`（检查更新，离线可跑） |
 | 小米云会话过期了 | `node notes/tools/mi-login.mjs`：扫码/链接确认重登，自动写回 `mi-session.json`（**本地脚本，未随仓库发布**）。备份依赖：`mi-login-qr.png`。细节见 `docs/小米云取数.md` §4 |
 | 提交前自查隐私 | `node spike/prepublish-check.mjs`（扫绝对路径 / 邮箱 / 设备号 / 凭据） |
 | 认识体重卡那条链路 | `docs/小米云取数.md`，代码入口 `readWeight()` |
@@ -76,11 +76,12 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 > `notes/` 和代码放在同一个文件夹里，方便一起看；但它**永远不进 git**（`git status` 里看不到，`.gitignore` 已挡整目录）。
 > 公开的部分只包含"能跑的东西 + 说明它为什么这么做"。
 
-## 4. 数据源契约（都是只读）
+## 4. 数据源契约（除 NowTree 收件箱外都是只读）
 
 | 源 | 位置 | 取法 | 注意 |
 |---|---|---|---|
-| NowTree 任务 | `%APPDATA%\com.nowtree.app\nowtree.sqlite` | `node:sqlite`（Node 24 内置）`readOnly` 打开，**每请求开关一次** | 表 `transactions`；`status='active'`、`deleted=0`、按 `time_slot` 过滤 |
+| NowTree 任务 | `%APPDATA%\com.nowtree.app\nowtree.sqlite` | `node:sqlite`（Node 24 内置）`readOnly` 打开，**每请求开关一次** | 表 `transactions`；`status='active'`、`deleted=0`、按 `time_slot` 过滤；Inbox = `status='inbox'` + `category IS NULL` |
+| NowTree 收件箱录入（v1.1.8） | 同一个库，**读写** | `POST /lifehud/api/inbox {title,note}` → `lib/inbox.js addInboxTask()`：`BEGIN IMMEDIATE` + 一条 INSERT + COMMIT | **唯一一处写别人的库**：只 INSERT（`status='inbox'`/`category=NULL`/`time_slot='none'`/`priority=1`），从不 UPDATE/DELETE；`created_time` 必须是 UTC + **9 位小数秒** + `+00:00`；库是 rollback journal（不是 WAL），写事务靠 `busy_timeout=3000` 等锁；**路径不存在时绝不能 `new DatabaseSync()`（会造出空库）**；`nowtreeWrite:false` 可整体关掉 |
 | NowTree 时段分界 | `%LOCALAPPDATA%\com.nowtree.app\EBWebView\Default\Local Storage\leveldb` | 字节搜索 `nowtree_slot_bounds`，取后面的 `{"morningStart":…}` | 值可能是 UTF-16，用 latin1 + 正则兜底；读不到就回退 6/13/18 |
 | 天气 | `https://api.open-meteo.com/v1/forecast` | 无需 key；`hourly=temperature_2m,precipitation_probability,weather_code,is_day` | Host 缓存 10 分钟；换位置后置空缓存；**单次超时 5s、失败后 2 分钟冷却、并发单飞**（`readWeather`，见 §6——别把超时调大，它挡在整页首屏前面） |
 | DSH 会话 | `$DSH_HOME/storages/session_projcache/sessions/session-<uuid>.json` | 读 json，`rows.title.val` + `rows.sessionListMetadata.val.lastPromptAt` | **sessionId 就是文件名里的 uuid**（去掉 `session-` 前缀）。不要解压 `session.v4.jsonl.zstd` |
@@ -93,7 +94,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 1. **零依赖**。不要 `pnpm add`：这个插件靠 Node 内置模块 + 原生 fetch 跑。
 2. **所有路由必须自己鉴权**。DSH **不会**给插件路由加会话保护——页面 `/` 返回 401，但 `/lifehud/api/*` 是裸的。现有做法：`isLocalPeer(req)` 只放行 `127.0.0.1 / ::1 / ::ffff:127.0.0.1`。新增路由必须照抄。
-3. **不写任何外部数据源**。NowTree 的库、AW 的库、DSH 的会话全部只读（AW 只在首次迁移时读一次文件）；LifeHud 自己的可写状态只放在 `dataDir`（默认 `~/.dsh/lifehud`）：体重镜像库 + 专注采集库 `capture.db`。
+3. **外部数据源默认只读，唯一例外是 NowTree 收件箱录入（v1.1.8）**。NowTree 的库只在你点任务卡「+」时**追加一行**（`lib/inbox.js`，只 INSERT，不 UPDATE/DELETE）；AW 的库只在首次迁移时读一次文件；DSH 会话永远只读。LifeHud 自己的可写状态只放在 `dataDir`（默认 `~/.dsh/lifehud`）：设置、倒计时状态 `countdown.json`、天气兜底 `weather-cache.json`、体重镜像库、专注采集库 `capture.db`。
 4. **界面文案中文**（"LifeHud" 这个品牌名除外，保持英文）。
 5. **主题适配**：只用 `currentColor` 和 `rgba(128,128,128,α)`，不写死颜色，深/浅主题都要看一眼。
 6. **改 Host 就重新装一次**（remove → install），**改 Client 就刷新页面**。
@@ -105,8 +106,11 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - **天气不可达时，别让整页陪它等超时**（2026-11-15）：`readWeather()` 原来是「超时 6s + 失败不重试」，于是天气一断，**每一次** `/hud` 都要 6.02s（实测四连），任务/会话/专注/热力全跟着慢——用户体感就是「重启后 LifeHud 加载变慢」。现在：**超时 5s**（2026-11-17 从 3s 调回：同链路实测耗时 0.27/0.33/0.48/**2.04/2.75** 秒，3s 只比长尾多 0.25s，太贴边，会把本来能成的请求判成超时）+ **失败后 2 分钟冷却**（冷却期内直接返回上次的值或 null，毫秒返回，不再打网络）+ **并发单飞**（N 个并发只打一次）；另外**上次成功的天气会落盘到 `<dataDir>/weather-cache.json`**（原来只在内存，一重启就没了 —— 于是断线 + 重启 = 既没新数据也没旧数据可兜底，卡片只能干说「取不到」）。回归用例：`probe-hud.mjs` 最后那组 10 条（含 Date.now 快进验证冷却到期会重试、stub fetch 验单飞）。**判活口径**：`/hud` 的 `weatherDiag` 字段——字段在＝新代码生效，缺失＝进程里还是旧 `hud.js`（见上一条）。天气卡底部会显示数据新旧（「取不到最新的 · 显示的是 12:47 的数据」），设置页诊断区另有一行。
 - **缓存里的「当前小时」必须按请求时刻重算**（2026-11-18）：天气 payload 是整包缓存的，`nowIndex`/`now`/`nowText` 是**取数那一刻**算好的。断线几小时后直接渲染，卡片会冻在取数时的小时上——真机踩到过「13:22 还显示 09:00 的 22.4℃」。现在 `buildHud` 出口统一过一遍 `refreshCurrentHour()`，按「今天 + 当前小时」重新定位当前点。回归用例：`probe-hud.mjs` 的「当前小时按请求时刻重算」。
 - **倒计时的计时器和提醒都必须活在 Host**（2026-11-19）：用户会切去对话——那一刻 LifeHud 的 React 组件被**卸载**，纯前端 `setInterval` 连同提醒一起消失。所以计时器在 `lib/countdown.js`（1 秒 tick，状态落盘 `<dataDir>/countdown.json`），到点用 **Windows PowerShell 5.1 + WinRT toast** 发系统通知。两个坑：① 中文文案必须走 **`-EncodedCommand`**（UTF-16LE base64）——写 `.ps1` 文件或直接塞进命令行都会乱码（PS 5.1 按 ANSI 读）；② 通知**入系统库有 1–3 秒延迟**，`wpndatabase.db` 里查不到不代表没发出去。AppID 用 `com.deepseek.dsh`（零配置，通知里显示 DeepSeek Harness）。**第三个坑（2026-11-19 实测）**：`spawn` 绝对不能带 `detached: true`——四组对照里只有「不 detached」的两组真正进了系统，带 detached 的退出码 0 但 toast 静默丢失。现在固定 `stdio: ['ignore','ignore','pipe']` 并把 stderr 收进 `notifyLast`（`/lifehud/api/countdown` 里能看到 `{at, code, err}`），出问题不用猜。验证：`spike/probe-countdown.mjs`（31 项，注入假 notifier 断言文案与"只发一次"）。
-- **Host 代码没有热更新**。改完必须 remove + install，否则你以为改了其实没生效。
+- **「天气备注有滞后性」的真相 = 冷却挡住了刷新，不是备注算错**（2026-11-20，v1.1.8 修）：用户看到「数据明明更新了，卡片还写着『数据取于 00:28（10 小时前）』」。查下来是两件事叠在一起——① 卡片上的温度是**按当前小时从这份预报里重新挑的**（`refreshCurrentHour`），小时一过数字就变，看起来像「刚更新过」；② 那次真的是 10 小时没取到（机器睡了一夜，第一条请求撞上 5s 超时），而工具条「刷新」以前**不带 force**，落在 2 分钟冷却里只会原样返回旧值，于是「点刷新也没用」。现在：`/hud?force=1` 让 `readWeather` 跳过 TTL **和**冷却（单飞仍然生效），「刷新」按钮走这条；备注也从卡片右下角挪到**大温度正下方**、措辞改成「这份预报取于 HH:mm（X 前）」。回归用例：`probe-hud.mjs` 第 9 组（force 跳冷却 / 跳 TTL / 仍旧单飞 / 页面确实传了 force）。
+- **「连续最长」不等于「单个窗口事件」**（2026-11-20，v1.1.8 改口径）：老口径取**单个事件**里扣掉 AFK 后最长的那个，于是「连续看了 27 分钟 B 站」被换视频切断，卡片只报 10 分钟，用户直接看不懂。现在 `lib/activity.js` 把**同一应用相邻出现**的段合并（`FOCUS_RUN_GAP_MS=60s`，切走一分钟内不算断），秒数仍然扣 AFK（与 top / tracking 同口径），卡片文案改成「连续最长」。**别改回按事件**，也别为了数字好看把 AFK 去掉——那会让「开着窗口去吃饭」变成最长段。
 - **但 remove → install 也不保证重新 import `plugin/lib/*.js`**（2026-11-15 实测）：Cordis 确实重新 apply 了入口，Node 的 ESM 缓存却按 URL 命中，**已经求值过的 `lib/*.js` 不会再跑一遍**。症状：`install_bundle` 返回 `changed:true`、`version` 也是新的，但 `/hud` 的 `version` 还是旧值、新加副作用不出现（当时删掉 `meta.miDeviceId` 再 `?force=1`，新代码会立刻重写它，结果没写 → 证明跑的仍是旧 `weight.js`）。**判别法**：找一个「只有新代码才会做」的副作用去验，或直接看 `/hud` 的 `version`；别拿 install 的返回值当生效证据。**真要让 Host 改动生效：重启 DSH**（重启后本会话可恢复）。
+  **2026-11-20 补充（v1.1.8 实测）**：这次 remove → install 之后 `hud.js` / `activity.js` / `index.js` / `inbox.js` 的新代码**确实生效了**（`/hud` 多出 `tasks.inboxCount`、`GET /inbox` 回 405 而不是 404），唯独 `update.js` 里那个「模块加载时读一次」的 `PLUGIN_VERSION` 还是旧值——说明重装大概率是**按文件重新求值**（没改动的文件继续吃旧模块）。两条结论：① 判活永远找一个「只有新代码才会做」的副作用，别信 install 的返回值；② **别把可观测状态缓存在模块顶层**，版本号就是活例子（v1.1.8 起 `pluginVersion()` 每次读 package.json）。
+- **写 NowTree 的库有三个硬约束**（2026-11-20，v1.1.8）：① 它是 **rollback journal（不是 WAL）**，写的时候会短暂锁库——必须 `PRAGMA busy_timeout=3000` + `BEGIN IMMEDIATE`，否则一撞上 NowTree 自己落盘就 `SQLITE_BUSY`；② Inbox 的判定是 **`status='inbox'` 且 `category IS NULL`**（`time_slot='none'`），照抄它自己新建记录的形状（`priority=1`、`show_in_next=0`、`order_index=NULL`），`created_time` 必须是 **UTC + 9 位小数秒 + `+00:00`**；③ `new DatabaseSync(path)` 在**路径不存在时会凭空造一个空库**——写之前必须 `existsSync`，否则会在 NowTree 目录里留一个没有表结构的假库。回归用例：`probe-inbox.mjs`（38 项，含「原有行逐字节未变」「锁住时等到超时并报 busy」「不存在时不造文件」）。
 - **插件路由不设防**（见约定 2）。
 - **NowTree 的 `time_slot` 语义**：库里 58 条 active，但符合 NowTree 自身"Next"语义的只有 2 条。本插件的口径是**用户视角**——只要 `time_slot` 命中当前时段就显示，另用 `NEXT` 徽标标出哪些在 NowTree 的 Next 里。
 - **AW 事件量**：一天 500+ 条正常，`limit=20000` 足够；不要按秒刷。
@@ -134,7 +138,7 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 
 ## 7. 当前状态
 
-- ✅ 七张卡：当前时段任务、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图 + 最长一段，**v1.1.1 起数据自己采**）、热力日历（当月 · GitHub 风格）、**倒计时（v1.1.6：单个 · 一段时长 · Host 侧计时 · 到点弹系统通知）**、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线）**。
+- ✅ 七张卡：当前时段任务（**v1.1.8 起右上角有「+」：弹窗填标题/备注，直接记一条到 NowTree 的 Inbox**）、天气（逐小时图标）、最近会话（运行中转圈 / hover 高亮 / 点击跳转）、专注（横向条形图 + **连续最长**一段，**v1.1.1 起数据自己采**）、热力日历（当月 · GitHub 风格）、**倒计时（v1.1.6：单个 · 一段时长 · Host 侧计时 · 到点弹系统通知）**、**体重（v1.1.0：最近有数据的 7 个测量日 · 手写 SVG 折线 · v1.1.8 加均值虚线）**。
   （相框卡在 v1.1.6 移除：上传/删除路由与 `lifehud-photo.*` 存储一并删掉，已存在的照片文件不自动删、只是不再读。）
   「网页对话 ↗」是工具条上的外链按钮（`window.open`），**不是卡片**。
 - ✅ 布局：flex 便当盒两行 —— 行 1 = 天气(宽) · 体重 · 任务；行 2 = 专注 · 会话 · 倒计时 · 热力。
@@ -146,7 +150,8 @@ notes/             **本地私人笔记**（调研 / 心智记录 / 私人文档
 - ✅ HUD 自动刷新（v1.1.1）：Client `useHud()` 每 5 分钟静默重取一次（页面隐藏时不发请求，`visibilitychange` 回页面补一次；三道护栏防并发：hidden / `prefetch` 在飞 / `HUD_TTL` 未过期都跳过）。
 - ✅ 体重同步：Host 每 10 分钟自动拉一次小米云（定时器可 dispose）；页面「刷新」按钮带 `?force=1` 立即拉，**这是"刚踩秤就能看到"的主路径**。
 - ✅ 体重健壮性（v1.1.3）：会话过期不再被误报成「云端异常」（426/SERVICETOKEN_EXPIRED → `session-expired`，卡片提示「请重新登录」）；设备指纹改成持久固定（见 §6），避免被小米风控当成盗号而提前掐会话。
-- ✅ 天气健壮性（v1.1.4 / v1.1.5）：单次取值超时 5s、失败后 2 分钟冷却、并发单飞、**上次成功的天气落盘兜底**、**当前小时按请求时刻重算**（见 §6）。天气不可达时 `/hud` 毫秒返回；有落盘数据时天气卡显示上次的天气 + 一句「取不到最新的 · 显示的是 X 前的数据」，没有数据才显示「取不到」。`/hud` 暴露 `weatherDiag`（缓存/失败/超时/冷却的生效值），设置页诊断区另有一行中文状态，也用来判断进程里跑的是哪一版代码。
+- ✅ 天气健壮性（v1.1.4 / v1.1.5 / **v1.1.8**）：单次取值超时 5s、失败后 2 分钟冷却、并发单飞、**上次成功的天气落盘兜底**、**当前小时按请求时刻重算**（见 §6）。天气不可达时 `/hud` 毫秒返回；有落盘数据时天气卡显示上次的天气 + 一句「取不到最新天气 · 这份预报取于 HH:mm（X 前）」（**v1.1.8 起这行在大温度正下方**，不再缩在卡片右下角），没有数据才显示「取不到」。**「刷新」带 `?force=1`**：跳过 TTL 与冷却、老老实实打一次（冷却期内点刷新不再拿回旧值）。`/hud` 暴露 `weatherDiag`（缓存/失败/超时/冷却的生效值），设置页诊断区另有一行中文状态，也用来判断进程里跑的是哪一版代码。
+- ✅ v1.1.8 的三处增量：**任务卡「+」→ 收件箱录入**（`POST /inbox`，唯一写外部库的路径，卡片底部显示「NowTree 收件箱 N 条」当下落反馈）、**体重卡均值虚线**（7 个测量日的算术平均，HUD 接口新增 `average`）、**专注卡改「连续最长」**（见 §6）。
 - ✅ 检查更新（v1.1.2）：页面「设置 → 版本与更新」手动点才联网（**不做启动自动检查**）；Host 读 GitHub Release/Tag，取最大语义版本，有 Release 就显示发布日期与正文；`/hud` 新增 `version` 字段（Host 版本），页面拿它和 `BUILD` 对比提示「页面资源旧了」；上次结果存 localStorage（键 `lifehud.update.v1`，版本变了自动作废，只回显不发请求）。
 - ⚠️ 「打开 DSH 就默认停在这一页」与「自动收起侧边栏」**尚未实现**：DSH 的 layout/sidebar 服务没有公开的"设默认页 / 强制收起"接口，需要单独 spike。
 - ⚠️ 天气的"一句话"是规则拼的，不是模型生成。
@@ -172,7 +177,7 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
 - **降级**：采集库不存在（刚装、还没采到）→ `focus.available=false` + `heatmap:[]` + `idle` 四档 0，卡片显示「还没有采集到数据」，HUD 其余部分照常。
 - **诊断**：`buildHud().capture` = `{running, pid, dbPath, samples, writes, pending, restarts, noise, pollSeconds, lastSampleAt, lastError, warnings[]}`（`writes` 是 INSERT+UPDATE 的写入次数，不是库内行数；v1.1.2 从 `rows` 改名）。采集器 stderr 只在进程退出时随详情进 `warnings`，另有退出码与迁移失败。这些字段只走 `/hud` 接口与探针；设置里的诊断区目前只渲染 `warnings` 文本，**不渲染 `capture.*`**。
 - **改它的入口**：`plugin/collector.ps1`（采样）、`lib/capture.js`（合并/落盘/迁移）、`lib/activity.js`（聚合）、`lib/hud.js`（组装）。
-- **验证**：`node spike/probe-hud.mjs`（确定性 35 项，末组 10 条是天气超时/冷却/单飞）、`node spike/probe-hud.mjs --real`（真实采集库 38 项）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP）。
+- **验证**：`node spike/probe-hud.mjs`（确定性 42 项，末组是天气超时/冷却/单飞/force）、`node spike/probe-hud.mjs --real`（真实采集库）、`node spike/probe-focus.mjs [http://127.0.0.1:<端口>]`（独立验收：模型/迁移对账、AFK 口径、合并压缩、单例、HTTP；它的 A18/A19/B1 依赖「本机 AW 已停」这个前提，AW 又被启动时会红，与代码无关）。
 
 ### 体重卡怎么工作（v1.1.0，重要）
 
@@ -183,8 +188,8 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
    └→ user/get_user_device_data
       └→ Host pullWeight()              RC4 签名 + 会话文件（docs/小米云取数.md）
          └→ saveWeightRows()            按 weight_id upsert 到 <dataDir>/lifehud-weight.db
-            └→ readWeightLocal()        取最近有数据的 7 个测量日（同日取最后一次，升序）
-               └→ GET /lifehud/api/weight [?force=1]  → {ok,stale,reason,lastSyncAt,points[]}
+            └→ readWeightLocal()        取最近有数据的 7 个测量日（同日取最后一次，升序）+ 算术平均 average
+               └→ GET /lifehud/api/weight [?force=1]  → {ok,stale,reason,lastSyncAt,points[],average}
                   └→ Client fetchWeight()/useWeight() → WeightBody → 体重卡
 ```
 
@@ -199,9 +204,10 @@ plugin/collector.ps1        长驻子进程，每 2 秒 stdout 一行 JSON（UTF
   2. **左侧纵轴 + 刻度数字**：4 档 nice 刻度（`0.1/0.2/0.25/0.5/1/2/5` 里挑 step），y 映射用圆整范围而不是数据 min/max，每档一条虚线网格；刻度字号 `12.5px`（与天气卡逐小时温度同档），所以左侧要留 **34px** 的 gutter；
   3. **点值默认隐藏，鼠标悬停才显示**（2026-11-09 按用户反馈调整）：鼠标移到某一天所在的整列（SVG 里每列一个 `rect`，`fill:none` + `pointer-events:all`）→ 该点放大 + 竖向虚线 + **只显示数值**的标签（`12.5px / 600`；最多 2 位小数去尾零，如 `66.5` / `66.02`；**不要带日期**，日期横轴上已经有）。顶部大数字同一精度口径；
   4. 底部日期标签行：字号同样 `12.5px`、颜色 `rgba(128,128,128,0.85)`，与点中心对齐（日期行要让出纵轴 gutter 的 34px）；
-  5. 颜色只用 `currentColor` / `rgba(128,128,128,α)`，深/浅主题都要能读。
+  5. 颜色只用 `currentColor` / `rgba(128,128,128,α)`，深/浅主题都要能读；
+  6. **均值虚线（v1.1.8）**：横穿绘图区的一条 `strokeDasharray:'5 4'` / `rgba(128,128,128,0.6)` 细线，位置 = `average` 在 nice 轴上的百分比（值永远落在轴范围内，不需要改轴）；线右端上方一行 `11px` 的「均值 67.42」——**必须是 HTML 覆盖层**（SVG `<text>` 会被拉伸变形）；它排在网格之后、折线与圆点之前，别盖住数据。
 - **改它的入口**：`client.js` 的 `useWeight` / `WeightChart` / `WeightBody`；Host 侧 `plugin/lib/weight.js` 的 `readWeight` / `pullWeight` / `miFailureReason`。
-- **验证**：`node spike/probe-weight.mjs`（48 项，含幂等/缺失日/stale/TTL/失败分类/设备指纹/路由契约）。
+- **验证**：`node spike/probe-weight.mjs [http://127.0.0.1:<端口>]`（53 项，含幂等/缺失日/stale/TTL/失败分类/设备指纹/`average` 均值/路由契约）。**路由契约里 `allowed` 字段清单是白名单**：加字段必须同步改它，否则 7.1 会红。
 
 ### 倒计时卡怎么工作（v1.1.6，重要）
 
@@ -271,6 +277,7 @@ view.addEventListener('dom-ready', () => view.loadURL(url));
 6. 热力日历换指标（当前是本地采集库的每日活跃分钟；token 需自建日表）。
 7. 检查更新「自动查/后台查」：现在刻意是手动（用户 2026-11-12 的选择）；若要改成启动自动查或发现新版弹提示，先跟用户确认联网频率。
 8. **结构清理**：`index.js` 已在 v1.1.2 拆成 `lib/`（S3）；`idle_seconds` 已作为第三条流落库（P1）。剩下的后续项（检查更新自动查、1.2 空闲强度展示）与「明确不做」的清单在 [`docs/BACKLOG.md`](docs/BACKLOG.md)。
+9. **收件箱录入的下一步**（v1.1.8 只做了「标题+备注 → 追加一条」）：① 记完能撤销（现在还得多开 NowTree 删）；② 弹窗里支持选时段/截止日（要真的 UPDATE 行，风险更高，得先跟用户确认）；③ 卡片里直接列出最近几条 inbox 记录（现在是只给计数）。
 
 ## 9. 与用户协作的方式
 
