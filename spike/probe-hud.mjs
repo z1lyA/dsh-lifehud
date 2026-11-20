@@ -6,11 +6,14 @@
 // 进程无关。这里先往临时库里灌一「已知形状」的样本，再断言聚合结果——不用碰真实
 // 数据，也不用开着任何外部服务。
 import { DatabaseSync } from 'node:sqlite';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 import { tmpdir, homedir } from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { buildHud, openCaptureDb, readOwnActivity, readWeather, clearWeatherCache, weatherStatus } from '../plugin/index.js';
 import { NOWTREE_DB, NOWTREE_LEVELDB } from './paths.mjs';
+
+const REPO = dirname(dirname(fileURLToPath(import.meta.url)));
 
 const results = [];
 /** @param {string} name @param {boolean} pass @param {string} [detail] */
@@ -410,6 +413,46 @@ try {
       check('当前小时按请求时刻重算（不是冻在取数那一刻）',
         hourHud.weather?.nowIndex === wantHour,
         `nowIndex=${hourHud.weather?.nowIndex} 期望=${wantHour}`);
+
+      // 9) v1.1.8：force 必须跳过「失败冷却 + TTL」。
+      //    真机上踩到的：冷却的 2 分钟里点「刷新」只会拿回旧值，于是数据明明能取到、
+      //    卡片却一直写着「取不到最新天气」——这就是用户说的「备注有滞后性」。
+      clearWeatherCache();
+      calls = 0;
+      globalThis.fetch = async () => { calls += 1; throw new TypeError('stub: 断了'); };
+      await run();                                            // 失败 → 进冷却
+      const blocked = await run();                            // 冷却期内：不打网络
+      const callsBeforeForce = calls;
+      let forceThrew = false;
+      try { await readWeather(LAT, LON, { force: true }); } catch { forceThrew = true; } // 强制：必须真打一次
+      check('冷却期内的普通请求仍然不打网络（对照组）', callsBeforeForce === 1 && blocked === null,
+        `calls=${callsBeforeForce}`);
+      check('force 跳过失败冷却（冷却期内点了刷新就真的重试）', calls === 2, `calls=${calls}`);
+      check('force 仍然把失败抛出去（不吞错、不假装成功）', forceThrew, String(forceThrew));
+
+      clearWeatherCache();
+      calls = 0;
+      globalThis.fetch = async () => { calls += 1; return okResponse(); };
+      await run();                                            // 成功 → 缓存 10 分钟
+      await run();                                            // TTL 内：不打网络
+      const ttlCalls = calls;
+      await readWeather(LAT, LON, { force: true });            // 缓存新鲜也强制重取
+      check('force 跳过 10 分钟 TTL（缓存新鲜也真的重取）', ttlCalls === 1 && calls === 2, `calls=${calls}`);
+
+      clearWeatherCache();
+      calls = 0;
+      globalThis.fetch = async () => {
+        calls += 1;
+        await new Promise((r) => setTimeout(r, 30));
+        return okResponse();
+      };
+      await Promise.all([readWeather(LAT, LON, { force: true }), readWeather(LAT, LON, { force: true })]);
+      check('force 也走单飞（两个并发强制刷新只打一次网络）', calls === 1, `calls=${calls}`);
+
+      // 页面侧：工具条「刷新」必须真的把 force 传下去，否则上面那条 Host 能力等于没用上。
+      const clientSrc = readFileSync(join(REPO, 'plugin', 'client.js'), 'utf8');
+      check('页面「刷新」走 force（reload(true) + ?force=1）',
+        /reload\(true\)/.test(clientSrc) && /`\$\{HUD_URL\}\?force=1`/.test(clientSrc));
     } finally {
       globalThis.fetch = realFetch;
       Date.now = realNow;

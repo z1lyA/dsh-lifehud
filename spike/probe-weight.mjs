@@ -227,6 +227,18 @@ try {
       + `（云端只回时间窗内的记录，本地保留历史）`;
   });
 
+  await check('1.4', 'average = 这 7 个点的算术平均（2 位小数、落在 min~max 之间）', async () => {
+    const snap = syncedSnapshot;
+    assert(Number.isFinite(snap.average), `average 不是数字 (${snap.average})`);
+    const mean = snap.points.reduce((s, p) => s + p.weight_kg, 0) / snap.points.length;
+    assert(Math.abs(snap.average - mean) < 0.006, `average=${snap.average} 与复算 ${mean.toFixed(4)} 不符`);
+    eq(snap.average, Math.round(snap.average * 100) / 100, 'average 是否超过 2 位小数');
+    const weights = snap.points.map((p) => p.weight_kg);
+    assert(snap.average >= Math.min(...weights) - 1e-9 && snap.average <= Math.max(...weights) + 1e-9,
+      `average=${snap.average} 落在点值范围 ${Math.min(...weights)}~${Math.max(...weights)} 之外`);
+    return `${snap.points.length} 点均值 ${snap.average}kg（复算 ${mean.toFixed(4)}，点值范围 ${Math.min(...weights)}~${Math.max(...weights)}）`;
+  });
+
   // ════════════════ 2. 落库正确 ════════════════
   console.log('\n2) 落库正确（node:sqlite 直读）');
   const dbMain = dbOpen(REAL_DB);
@@ -847,7 +859,7 @@ try {
     assert(ctype.startsWith('application/json'), `content-type 是 ${ctype}（前端 res.json() 依赖它）`);
     eq(String(res.headers.get('cache-control') ?? ''), 'no-store', 'cache-control（force 刷新必须绕开浏览器缓存）');
     liveBody = await res.json();
-    const allowed = new Set(['ok', 'stale', 'reason', 'lastSyncAt', 'points', 'archived', 'error']);
+    const allowed = new Set(['ok', 'stale', 'reason', 'lastSyncAt', 'points', 'average', 'archived', 'error']);
     const extra = Object.keys(liveBody).filter((k) => !allowed.has(k));
     eq(extra.join(','), '', '契约外的多余字段');
     eq(typeof liveBody.ok, 'boolean', 'typeof ok');
@@ -856,7 +868,10 @@ try {
     assert(Number.isFinite(liveBody.lastSyncAt), `lastSyncAt 类型 ${typeof liveBody.lastSyncAt}`);
     assert(Array.isArray(liveBody.points), 'points 不是数组');
     assertCleanPoints(liveBody.points, 'live points');
-    return `200 ${ctype} + cache-control=${res.headers.get('cache-control')}；键=[${Object.keys(liveBody).join(',')}]；points=${liveBody.points.length} stale=${liveBody.stale} archived=${liveBody.archived}`;
+    // v1.1.8：average（7 个测量日的均值，画虚线用）。有数据就必须是数字，没数据允许 null。
+    assert(liveBody.average === null || Number.isFinite(liveBody.average), `average 类型 ${typeof liveBody.average}`);
+    if (liveBody.points.length > 0) assert(Number.isFinite(liveBody.average), 'points 非空却没有 average');
+    return `200 ${ctype} + cache-control=${res.headers.get('cache-control')}；键=[${Object.keys(liveBody).join(',')}]；points=${liveBody.points.length} average=${liveBody.average} stale=${liveBody.stale} archived=${liveBody.archived}`;
   });
 
   await check('7.2', '路由返回的点 = 本地库最新 7 个测量日（Host 进程与我读的是同一份口径）', async () => {
@@ -945,6 +960,7 @@ try {
       ['typeof p.date === ', 'points[].date'],
       ['data.stale', 'stale'],
       ['data.lastSyncAt', 'lastSyncAt'],
+      ['data.average', 'average'],
     ];
     const missing = need.filter(([needle]) => !src.includes(needle)).map(([, label]) => label);
     eq(missing.join(','), '', '前端缺失的字段引用');
