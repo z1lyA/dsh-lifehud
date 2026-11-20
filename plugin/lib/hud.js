@@ -3,35 +3,19 @@
  * 从 plugin/index.js 拆出（v1.1.2 评审 S3）。
  */
 import { DatabaseSync } from 'node:sqlite';
-import { readFileSync, readdirSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join } from 'node:path';
 import { readOwnActivity, emptyActivity } from './activity.js';
 import { captureStatus, captureWarnings } from './capture.js';
 import { countInboxTasks } from './inbox.js';
 import { readSettingsFile } from './settings.js';
 import { pluginVersion } from './update.js';
 import { envPath } from './util.js';
+import { createWeatherSource } from './weather.js';
 
 const DEFAULT_BOUNDS = { morningStart: 6, noonStart: 13, eveningStart: 18 };
 const SLOT_LABEL = { morning: '早', noon: '午', evening: '晚', rest: '休息' };
-/** 成功取到一次就复用这么久，避免开页面就打一次天气 API。 */
-const WEATHER_TTL_MS = 10 * 60 * 1000;
-/**
- * 单次取天气的超时。
- *
- * 实测同一条链路的耗时分布很不均匀：0.27 / 0.33 / 0.48 / **2.04 / 2.75** 秒
- * ——大多数很快，但有一条长尾。3 秒只比长尾多 0.25 秒，等于把及格线贴着最差成绩画，
- * 线路稍慢就把本来能成的请求判成超时（2026-11-17 真机上半天看不到天气，部分是这个原因）。
- * 5 秒给长尾留 2 秒余量；因为下面还有失败冷却，页面不会退回「每次刷新都卡满超时」。
- * 别调大：`/hud` 是整页首屏的入口，天气卡等多久，其它卡就跟着等多久。
- */
-const WEATHER_TIMEOUT_MS = 5000;
-/**
- * 失败后的冷却窗口：这段时间里 `/hud` **不再**去试探天气，直接给上次的值（或空）。
- * 没有它的话，天气一路不通 = 每次刷新都白等一个完整超时，页面会「一直很慢」。
- */
-const WEATHER_FAIL_COOLDOWN_MS = 2 * 60 * 1000;
 
 /** NowTree 的 SQLite（`%APPDATA%\com.nowtree.app\nowtree.sqlite`）。 */
 const defaultNowtreeDb = () => envPath(process.env.APPDATA ?? '', 'com.nowtree.app', 'nowtree.sqlite');
@@ -138,83 +122,6 @@ function readSlotTasks(dbPath, slot) {
   }
 }
 
-/** WMO code + day flag → text + icon key. */
-function weatherKind(code, day) {
-  if (code === 0) return { text: '晴', icon: day ? 'sun' : 'moon' };
-  if (code === 1) return { text: '晴间多云', icon: day ? 'partly' : 'moon-cloud' };
-  if (code === 2) return { text: '多云', icon: 'cloud' };
-  if (code === 3) return { text: '阴', icon: 'cloud' };
-  if (code === 45 || code === 48) return { text: '雾', icon: 'fog' };
-  if (code >= 51 && code <= 57) return { text: '毛毛雨', icon: 'drizzle' };
-  if (code >= 61 && code <= 67) return { text: '雨', icon: 'rain' };
-  if (code >= 71 && code <= 77) return { text: '雪', icon: 'snow' };
-  if (code >= 80 && code <= 82) return { text: '阵雨', icon: 'rain' };
-  if (code >= 85 && code <= 86) return { text: '阵雪', icon: 'snow' };
-  if (code >= 95) return { text: '雷雨', icon: 'storm' };
-  return { text: '—', icon: 'cloud' };
-}
-
-/**
- * Hourly weather from Open-Meteo, shaped for a phone-style strip.
- * @param {number} lat @param {number} lon
- * @returns {Promise<object>} weather
- */
-async function fetchWeather(lat, lon) {
-  const url = 'https://api.open-meteo.com/v1/forecast'
-    + `?latitude=${lat}&longitude=${lon}`
-    + '&hourly=temperature_2m,precipitation_probability,weather_code,is_day'
-    + '&daily=sunrise,sunset&forecast_days=2&timezone=Asia%2FShanghai';
-  const response = await fetch(url, { signal: AbortSignal.timeout(WEATHER_TIMEOUT_MS) });
-  if (!response.ok) throw new Error(`open-meteo HTTP ${response.status}`);
-  const data = await response.json();
-  const times = data.hourly?.time ?? [];
-  if (times.length === 0) throw new Error('open-meteo: empty hourly data');
-
-  const temps = data.hourly.temperature_2m ?? [];
-  const probs = data.hourly.precipitation_probability ?? [];
-  const codes = data.hourly.weather_code ?? [];
-  const isDay = data.hourly.is_day ?? [];
-  // 48 points (today + tomorrow) so the strip can run past midnight when the
-  // remaining hours of today are fewer than the requested count.
-  const hourly = times.map((time, i) => {
-    const day = (isDay[i] ?? 1) === 1;
-    const kind = weatherKind(codes[i] ?? 0, day);
-    return {
-      i,
-      day: Number(String(time).slice(8, 10)),
-      h: Number(String(time).slice(11, 13)),
-      t: Math.round((temps[i] ?? 0) * 10) / 10,
-      p: Number(probs[i] ?? 0) || 0,
-      icon: kind.icon,
-      text: kind.text,
-    };
-  });
-
-  const nowHour = new Date().getHours();
-  const nowIndex = Math.min(nowHour, hourly.length - 1);
-  const current = hourly[nowIndex] ?? hourly[0];
-  const todayPoints = hourly.slice(0, Math.min(24, hourly.length));
-  const min = Math.min(...todayPoints.map((p) => p.t));
-  const max = Math.max(...todayPoints.map((p) => p.t));
-  const rainMax = Math.max(...todayPoints.map((p) => p.p));
-  const rainText = rainMax >= 60 ? '有雨，带伞' : rainMax >= 30 ? '可能有雨' : '全天无雨';
-  const gapText = max - min >= 10 ? '，昼夜温差大' : '';
-
-  return {
-    now: current.t,
-    nowIcon: current.icon,
-    nowText: current.text,
-    min,
-    max,
-    rainMax,
-    nowIndex,
-    summary: `${min}–${max}℃，${rainText}${gapText}`,
-    sunrise: String(data.daily?.sunrise?.[0] ?? '').slice(11, 16),
-    sunset: String(data.daily?.sunset?.[0] ?? '').slice(11, 16),
-    hourly,
-  };
-}
-
 /**
  * 让「当前小时」跟着真实时间走。
  *
@@ -222,6 +129,7 @@ async function fetchWeather(lat, lon) {
  * **取数那一刻**算好的。直接拿去渲染，断线几小时后卡片就会冻在取数时的小时上——
  * 2026-11-18 真机踩到：13:22 卡片还停在 09:00 的 22.4℃。
  * 这里按「今天 + 当前小时」重新定位当前点；越界就退到最接近的一个。
+ * （取数本身在 `lib/weather.js`；这一步只属于"渲染前把时间对上"，所以留在组装层。）
  * @param {object|null} weather @returns {object|null}
  */
 function refreshCurrentHour(weather) {
@@ -238,165 +146,41 @@ function refreshCurrentHour(weather) {
   return { ...weather, nowIndex: idx, now: current.t, nowText: current.text, nowIcon: current.icon };
 }
 
-/** @type {{key:string,at:number,value:object}|null} */
-let weatherCache = null;
-/** @type {{key:string,at:number,message:string}|null} 上一次失败（冷却窗口从这里算起） */
-let weatherFail = null;
-/** @type {{key:string,promise:Promise<object>}|null} 单飞：并发请求共用同一次尝试 */
-let weatherInflight = null;
 /**
- * 「上次成功的天气」落盘位置（`<dataDir>/weather-cache.json`）。
+ * 天气通道的落盘位置（`<dataDir>/weather-cache.json`）。
  *
  * 为什么必须落盘：内存缓存一重启就没了。天气链路断的时候，重启后的进程既没有新数据、
  * 也没有旧数据可兜底，卡片只能干说「取不到」——用户看到的就是「重启之后半天没天气」。
- * 落盘之后，重启也能立刻显示上次的天气 + 它的时间，并明确标注「取不到最新的」。
+ * 落盘之后，重启也能立刻显示上次的天气 + 它的时间。
  */
 let weatherStorePath = '';
-/** 每个进程只从磁盘读一次，别每个请求都摸文件。 */
-let weatherStoreLoaded = false;
+/** @type {ReturnType<typeof createWeatherSource>|null} 进程内唯一的天气通道 */
+let weatherSource = null;
 
-/** 把上次成功的天气读回内存（没有/坏了都当没缓存，绝不抛）。 */
-function loadStoredWeather() {
-  if (weatherStoreLoaded) return;
-  weatherStoreLoaded = true;
-  if (!weatherStorePath) return;
-  try {
-    const raw = JSON.parse(readFileSync(weatherStorePath, 'utf8'));
-    if (raw && typeof raw.key === 'string' && Number.isFinite(Number(raw.at)) && raw.value) {
-      weatherCache = { key: raw.key, at: Number(raw.at), value: raw.value };
-    }
-  } catch { /* 首次运行没有这个文件，属正常 */ }
-}
-
-/** 成功后落盘；写不进去只影响"重启后能不能兜底"，不影响本次结果。 */
-function storeWeather(entry) {
-  if (!weatherStorePath) return;
-  try {
-    mkdirSync(dirname(weatherStorePath), { recursive: true });
-    writeFileSync(weatherStorePath, JSON.stringify(entry), 'utf8');
-  } catch { /* 只读目录 / 磁盘满：忽略 */ }
-}
-
-/** 上一次成功取到的值（哪怕已过期）—— 失败时用它兜底，别再让页面空着。 */
-const staleWeather = (key) => (weatherCache && weatherCache.key === key ? weatherCache.value : null);
-
-/**
- * 失败后的**一次性**后台补拉（v1.1.9）。
- *
- * 为什么要它：机器睡了一觉 / DSH 刚重启时，进程里的**第一次**外网连接常常是冷的
- * （DNS、TLS 会话、代理隧道都要现建），5 秒超时刚好把它切断。2026-11-20 实测：
- * 同一分钟里 PowerShell 0.4s、独立 node 0.3–1.9s 都能取到，只有 Host 那道 5s 超时被砍；
- * 于是卡片落到磁盘上几小时前的预报，要等下一次页面请求（最多 5 分钟）才重试。
- *
- * 三条纪律：
- *   1. **只补一次**：补拉自己失败时不再排下一次（`scheduleRetry: false`），
- *      否则断网时会变成每 25 秒一次的轮询——那正是失败冷却想避免的事；
- *   2. **在后台**：不在 `/hud` 的请求路径上，谁也不用陪它等，首屏延迟不变；
- *   3. **幂等**：同一坐标只挂一个待办；期间已有新数据就跳过；`clearWeatherCache()` 顺手取消。
- */
-const WEATHER_RETRY_MS = 25 * 1000;
-/** @type {{key:string,timer:ReturnType<typeof setTimeout>}|null} */
-let weatherRetry = null;
-/** 探针可以把它改小（生产恒为 WEATHER_RETRY_MS）。 */
-let weatherRetryDelayMs = WEATHER_RETRY_MS;
-
-function cancelWeatherRetry() {
-  if (!weatherRetry) return;
-  clearTimeout(weatherRetry.timer);
-  weatherRetry = null;
-}
-
-/** @param {string} key @param {number} lat @param {number} lon */
-function scheduleWeatherRetry(key, lat, lon) {
-  if (weatherRetry && weatherRetry.key === key) return; // 同一坐标已有待办
-  cancelWeatherRetry();
-  const timer = setTimeout(() => {
-    weatherRetry = null;
-    // 这期间已经被别的请求取到新鲜的了 → 没必要再打
-    if (weatherCache && weatherCache.key === key && Date.now() - weatherCache.at < WEATHER_TTL_MS) return;
-    void readWeather(lat, lon, { force: true, scheduleRetry: false }).catch(() => {});
-  }, weatherRetryDelayMs);
-  // 别让这个定时器把进程吊着（DSH 退出 / 探针结束时立即干净）
-  if (typeof timer.unref === 'function') timer.unref();
-  weatherRetry = { key, timer };
+/** 拿到天气通道（顺手同步落盘位置；缓存/失败都带 key，换坐标不会串味）。 */
+function weatherChannel() {
+  if (!weatherSource) weatherSource = createWeatherSource({ storePath: weatherStorePath });
+  else weatherSource.setStore(weatherStorePath);
+  return weatherSource;
 }
 
 /**
- * Cached weather so re-opening the page never waits on the network.
- *
- * 两层保护（2026-11-15 加）：天气服务不可达时，`/hud` 是整页首屏，
- * 不能让每个请求都等满一个超时（当时实测 6.02s/次，页面「一直很慢」）：
- *   1. 失败后进入 `WEATHER_FAIL_COOLDOWN_MS` 冷却 —— 期间直接返回上次的值/空，不再打网络；
- *   2. 并发请求单飞 —— N 个请求共用一次尝试，不会叠加成 N×超时。
- *
- * `options.force`（v1.1.8）：用户自己点了「刷新」，**跳过 TTL 与冷却**，老老实实打一次网络。
- * 这是 v1.1.8 修的那个「备注有滞后性」：冷却期内点刷新只会拿回上一次的旧值，
- * 于是数据明明能取到、卡片却还写着「取不到最新天气」——用户点一次就该知道到底通不通。
- * 单飞仍然生效（force 也不例外）：N 个并发的强制刷新只打一次网络。
+ * 取一次天气。`mode` 的全部语义都在 `lib/weather.js`：
+ *   - `cached`（默认）：10 分钟内复用；失败后 2 分钟冷却（冷却期给旧值/空）；
+ *     失败的尝试会在 25 秒后**后台补一次**（不在首屏路径上）；
+ *   - `refresh`：用户点「刷新」——跳过 TTL 与冷却，老老实实打一次；
+ *   - `retry`：后台补拉——同样强制，但失败后不再排下一次（断网时不变成轮询）。
  * @param {number} lat @param {number} lon
- * @param {{force?:boolean,scheduleRetry?:boolean}} [options]
- *   force 跳过 TTL 与失败冷却；scheduleRetry=false 表示这次失败不再排后台补拉（补拉自己用）
+ * @param {'cached'|'refresh'|'retry'|{mode?:string,force?:boolean}} [mode]
  * @returns {Promise<object|null>} weather
  */
-export async function readWeather(lat, lon, options = {}) {
-  const key = `${lat},${lon}`;
-  const force = Boolean(options.force);
-  loadStoredWeather(); // 重启后先把上次成功的值捞回来，才能兜底
-  if (!force && weatherCache && weatherCache.key === key && Date.now() - weatherCache.at < WEATHER_TTL_MS) {
-    return weatherCache.value;
-  }
-  if (!force && weatherFail && weatherFail.key === key && Date.now() - weatherFail.at < WEATHER_FAIL_COOLDOWN_MS) {
-    return staleWeather(key);
-  }
-  if (weatherInflight && weatherInflight.key === key) return weatherInflight.promise;
-
-  const attempt = (async () => {
-    try {
-      const value = await fetchWeather(lat, lon);
-      weatherCache = { key, at: Date.now(), value };
-      weatherFail = null;
-      cancelWeatherRetry(); // 已经有新数据了，别再补
-      storeWeather(weatherCache);
-      return value;
-    } catch (error) {
-      weatherFail = {
-        key,
-        at: Date.now(),
-        message: error instanceof Error ? error.message : String(error),
-      };
-      if (options.scheduleRetry !== false) scheduleWeatherRetry(key, lat, lon);
-      throw error;
-    }
-  })();
-
-  const entry = { key, promise: attempt };
-  weatherInflight = entry;
-  // 只清理自己这一轮：别把后来者的单飞记录抹掉，也别让这条链产生未处理的 rejection。
-  attempt.then(() => {}, () => {}).then(() => { if (weatherInflight === entry) weatherInflight = null; });
-  return attempt;
+export function readWeather(lat, lon, mode) {
+  return weatherChannel().read(lat, lon, mode);
 }
 
-/** 诊断/测试用：看一眼当前天气状态（不触发网络）。 */
+/** 诊断/测试用：看一眼当前天气状态（不触发网络）。字段名是既有契约（`weatherDiag`），别改名。 */
 export function weatherStatus() {
-  return {
-    cached: weatherCache ? { key: weatherCache.key, at: weatherCache.at } : null,
-    failed: weatherFail ? { key: weatherFail.key, at: weatherFail.at, message: weatherFail.message } : null,
-    inflight: Boolean(weatherInflight),
-    /** 有没有挂着一个「失败后补一次」的待办（v1.1.9，诊断用）。 */
-    retryPending: Boolean(weatherRetry),
-    retryMs: weatherRetryDelayMs,
-    cooldownMs: WEATHER_FAIL_COOLDOWN_MS,
-    timeoutMs: WEATHER_TIMEOUT_MS,
-  };
-}
-
-/**
- * 探针专用：把「失败后补一次」的延迟改小，好在毫秒级验证它。
- * 生产路径永远用默认的 25 秒（没有配置项，免得变成一个可调出来的轮询）。
- * @param {number} ms
- */
-export function setWeatherRetryDelayForTest(ms) {
-  weatherRetryDelayMs = Math.max(1, Number(ms) || WEATHER_RETRY_MS);
+  return weatherChannel().peek();
 }
 
 /**
@@ -471,7 +255,7 @@ function readSessions(projDir, limit, dshHome) {
  * Assemble the HUD snapshot.
  * @param {object} [config] bundle row config
  * @param {object} [runtime] extra runtime hooks ({ isRunning })
- * @param {{force?:boolean}} [options] force 天气跳过 TTL/冷却（页面「刷新」走这条）
+ * @param {{mode?:'cached'|'refresh'|'retry'}} [options] 天气取数模式（页面「刷新」传 `refresh`）
  * @returns {Promise<object>} payload
  */
 export async function buildHud(config = {}, runtime = {}, options = {}) {
@@ -503,7 +287,7 @@ export async function buildHud(config = {}, runtime = {}, options = {}) {
   const [activity, weather, sessions] = await Promise.all([
     // readOwnActivity 是同步的：包一层 Promise 才能和另外两路并发、也才能接住同步抛错。
     Promise.resolve().then(() => readOwnActivity(config, 84, aliases)).catch(failActivity),
-    readWeather(lat, lon, { force: Boolean(options.force) }).catch((error) => {
+    readWeather(lat, lon, { mode: options.mode }).catch((error) => {
       warnings.push(`weather: ${error instanceof Error ? error.message : String(error)}`);
       return weatherCache?.value ?? null;
     }),
@@ -558,9 +342,7 @@ export async function buildHud(config = {}, runtime = {}, options = {}) {
     warnings,
   };
 }
-/** 位置变了 / 设置更新后让天气下次重新拉。 */
+/** 位置变了 / 设置更新后让天气下次重新拉（顺带取消旧坐标的补拉待办）。 */
 export function clearWeatherCache() {
-  weatherCache = null;
-  weatherFail = null;
-  cancelWeatherRetry(); // 换位置后别让旧坐标的补拉继续打
+  weatherChannel().clear();
 }

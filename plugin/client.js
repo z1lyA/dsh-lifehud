@@ -24,7 +24,7 @@ if (!window.__lifehudClientRegistered) {
       const PANEL_ID = 'lifehud';
       const NS = 'lifehud';
       /** 客户端构建标记：改这里 → 页面上能一眼看出加载的是哪一版。 */
-      const BUILD = '1.1.9';
+      const BUILD = '1.1.10';
       const HUD_URL = '/lifehud/api/hud';
       const WEIGHT_URL = '/lifehud/api/weight';
       const SETTINGS_URL = '/lifehud/api/settings';
@@ -62,6 +62,8 @@ if (!window.__lifehudClientRegistered) {
        */
       const HUD_REFRESH_MS = 5 * 60 * 1000;
       let prefetch = null;
+      /** 任何 `/hud` 在飞的数量（含 force）。定时器只认它——否则手动刷新在飞时又会被拉一次。 */
+      let hudInFlight = 0;
       /** 请求序号：强制刷新取代先前在飞的普通请求时，旧响应不许回写 hudCache。 */
       let hudSeq = 0;
 
@@ -72,6 +74,7 @@ if (!window.__lifehudClientRegistered) {
       function fetchHud(force = false) {
         if (!force && prefetch) return prefetch;
         const seq = ++hudSeq;
+        hudInFlight += 1;
         const request = fetch(force ? `${HUD_URL}?force=1` : HUD_URL, { headers: { accept: 'application/json' } })
           .then((res) => {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -82,7 +85,10 @@ if (!window.__lifehudClientRegistered) {
             return data;
           })
           .catch(() => null)
-          .finally(() => { if (prefetch === request) prefetch = null; });
+          .finally(() => {
+            hudInFlight = Math.max(0, hudInFlight - 1);
+            if (prefetch === request) prefetch = null;
+          });
         if (!force) prefetch = request;
         return request;
       }
@@ -230,6 +236,38 @@ if (!window.__lifehudClientRegistered) {
         return `${Number(m[2])}/${Number(m[3])}`;
       }
 
+      /** 天气备注在 1 小时以内不吭声：预报本来就是按小时用的，报一次只会让人对提示脱敏。 */
+      const WEATHER_QUIET_MS = 60 * 60 * 1000;
+      /** 超过一天就换一种说法（带上日期，并提亮颜色）。 */
+      const WEATHER_OLD_MS = 24 * 60 * 60 * 1000;
+
+      /**
+       * 天气卡那句时效备注——纯函数，方便静态审查（照 `updateStatusText()` 的先例）。
+       *
+       * 语义：只看**数据有多旧**，不看"上次取数成没成"。失败信息只进 tooltip：
+       * 它解释"为什么旧"，不该自己变成一句主文案（以前一失败就报警，10 分钟也报）。
+       * @param {{cachedAt?:number, failedAt?:number, now?:number}} input
+       * @returns {{text:string,title:string,warn:boolean}|null} 不需要提示时返回 null
+       */
+      function weatherNoteOf({ cachedAt, failedAt, now = Date.now() } = {}) {
+        if (!cachedAt) return null; // 完全没有缓存：卡片自己的空态已经说了「天气取不到」
+        const age = Math.max(0, now - cachedAt);
+        if (age < WEATHER_QUIET_MS) return null; // 1 小时以内：安静
+        const failed = failedAt
+          ? `最近一次取数没成功：${hhmm(failedAt)}`
+          : '最近没有失败记录（可能这段时间页面没打开过）';
+        const title = `${failed}；工具条「刷新」可强制重取`;
+        if (age < WEATHER_OLD_MS) {
+          return { text: `预报已 ${Math.floor(age / 3600000)} 小时没更新 · 取自 ${hhmm(cachedAt)}`, title, warn: false };
+        }
+        const date = new Date(cachedAt);
+        return {
+          text: `预报是 ${Math.floor(age / 86400000)} 天前的 · 取自 ${date.getMonth() + 1}/${date.getDate()} ${hhmm(cachedAt)}`,
+          title,
+          warn: true,
+        };
+      }
+
       function useHud() {
         const [state, setState] = React.useState({
           loading: !hudCache, data: hudCache?.value ?? null, error: null,
@@ -267,7 +305,9 @@ if (!window.__lifehudClientRegistered) {
           let alive = true;
           const refreshQuietly = () => {
             if (!alive || document.hidden) return;
-            if (prefetch) return;
+            // 只要有请求在飞（普通或手动刷新）就跳过：force 不登记 prefetch，
+            // 以前这里会判空通过、再起一次 /hud（v1.1.10 修）。
+            if (hudInFlight > 0) return;
             if (hudCache && Date.now() - hudCache.at < HUD_TTL) return;
             fetchHud().then((data) => {
               if (!alive || !data) return;
@@ -1659,7 +1699,7 @@ if (!window.__lifehudClientRegistered) {
            * 顶部「刷新」：一次动作同时刷新 HUD 快照与体重。
            * 两边都带 force：体重跳过 Host 的 10 分钟云缓存（刚踩秤立刻可见）；
            * HUD 侧 force 让**天气**跳过 TTL 与失败冷却（v1.1.8）——以前冷却期内点刷新
-           * 只会拿回上一次的旧值，于是「点了几次刷新都还写着取不到最新天气」。
+           * 只会拿回上一次的旧值，于是「点了几次刷新，卡片还是那份旧预报」。
            * （hudCache 只在请求成功时被替换：失败时页面继续显示上一次的数据。）
            */
           const onRefresh = () => {
@@ -1718,25 +1758,18 @@ if (!window.__lifehudClientRegistered) {
           const openChat = () => window.open(settings.chatUrl || 'https://chat.deepseek.com/', '_blank', 'noopener');
 
           /* ---- 卡片 ---- */
-          // 天气卡底部状态：断线时明确告诉用户「这份预报是什么时候取的」。
-          // 数据来自 /hud 的 weatherDiag（Host 旧了就没有这个字段，整行不显示）。
-          // 措辞要点（v1.1.8 按用户反馈再改）：
-          //   ① 必须说清是**取数时刻**，不能写成「显示的是 4 小时前的数据」；
-          //   ② 必须说「预报」而不是「数据」——卡片上的温度是**按当前小时从这份预报里挑的**，
-          //      所以小时一过数字就会变，看起来像「刚更新过」，其实预报本身还是几小时前的。
-          //      用户 2026-11-20 就是被这一点骗到的：「数据明明更新了，备注却说 10 小时前」。
-          //   ③ 这行紧贴大温度（左栏），不再缩在卡片右下角——离数字太远就等于没写。
+          // 天气卡那句时效备注：**只看数据有多旧**，不看「上次请求成没成」（v1.1.10 改）。
+          // 以前是「上次失败就提示」，于是 10 分钟没取到也会在卡片上报一次警——但天气是预报，
+          // 十几分钟前取的照样能用，频繁报警只会让人对这句提示脱敏（2026-11-20 用户反馈）。
+          // 现在：< 1 小时不吭声；1–23 小时说「已 N 小时没更新」；≥ 24 小时说「N 天前的」。
           const weatherDiag = data?.weatherDiag ?? null;
-          const weatherStale = Boolean(weatherDiag?.failed);
-          const weatherNote = !weatherDiag ? '' : (() => {
-            const at = weatherDiag.cached?.at;
-            // 有缓存：只有这次真的没取到才提示（正常时一个字都不写）
-            if (at) return weatherStale ? `取不到最新天气 · 这份预报取于 ${hhmm(at)}（${relTime(at)}）` : '';
-            if (weatherStale) {
-              return weatherDiag.failed?.at ? `现在取不到 · ${relTime(weatherDiag.failed.at)}试过一次` : '正在获取…';
-            }
-            return weather ? '' : '正在获取…';
-          })();
+          const weatherNote = weatherNoteOf({
+            cachedAt: weatherDiag?.cached?.at,
+            failedAt: weatherDiag?.failed?.at,
+          });
+          // 数据够旧时，逐小时条里那一格就别自称「现在」了
+          const weatherStale = Boolean(weatherDiag?.cached?.at)
+            && Date.now() - weatherDiag.cached.at >= WEATHER_QUIET_MS;
 
           const weatherCard = h(Card, {
             key: 'weather',
@@ -1759,12 +1792,16 @@ if (!window.__lifehudClientRegistered) {
                   ]),
                   h('div', { key: 's', style: { fontSize: 13, color: '#c9def5', marginTop: 6 } }, weather.summary),
                   // 时效提示紧贴温度：贴在卡片右下角离数字太远，等于没写（v1.1.8 用户实测）。
+                  // v1.1.10 起只有「数据真的旧了」才出现（≥1 小时），措辞也不再是"取不到"。
                   weatherNote
                     ? h('div', {
                       key: 'wn',
-                      title: '天气服务这次没连上，显示的是上次成功取到的预报；工具条「刷新」可强制重试',
-                      style: { fontSize: 11.5, color: '#9ec6ee', marginTop: 5, lineHeight: 1.5, opacity: 0.9 },
-                    }, weatherNote)
+                      title: weatherNote.title,
+                      style: {
+                        fontSize: 11.5, marginTop: 5, lineHeight: 1.5, opacity: 0.9,
+                        color: weatherNote.warn ? '#ffd9a0' : '#9ec6ee',
+                      },
+                    }, weatherNote.text)
                     : null,
                 ]),
                 h('div', { key: 'right', style: { flex: '1 1 380px', minWidth: 0 } },

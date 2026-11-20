@@ -21,7 +21,7 @@ import { readdirSync, existsSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-import { buildHud, clearWeatherCache, nowtreeDbPath } from './lib/hud.js';
+import { buildHud, clearWeatherCache, nowtreeDbPath, readWeather } from './lib/hud.js';
 import { addInboxTask, countInboxTasks, InboxError } from './lib/inbox.js';
 import { readWeight, WEIGHT_TTL_MS } from './lib/weight.js';
 import { readUpdate } from './lib/update.js';
@@ -146,6 +146,41 @@ function applyInner(ctx, config) {
     } catch { /* logging must not fail activation */ }
   }
 
+  // 天气也定时暖着（v1.1.10）：和体重同一套范式——页面关着也同步，这样「打开就是新的」，
+  // 也不用再靠卡片上那句「预报取于 X 小时前」来提醒你。
+  //
+  // 和体重不同的两点：① 默认 30 分钟（预报本身有效以小时计，10 分钟一拉是浪费）；
+  // ② `weatherPollMs: 0` 可以整体关掉（关掉就退回 v1.1.9 的「按需取数 + 失败补一次」）。
+  // 每次 tick 重新读一次设置，所以「设置里改位置」不用等重启。
+  try {
+    const pollMs = Number(config.weatherPollMs ?? 30 * 60 * 1000);
+    ctx.effect(() => {
+      if (!(pollMs > 0)) return () => {};
+      const period = Math.max(60000, pollMs);
+      const timer = setInterval(() => {
+        try {
+          const settings = readSettingsFile(dataDir);
+          const lat = Number(settings.latitude ?? config.latitude ?? 39.9042);
+          const lon = Number(settings.longitude ?? config.longitude ?? 116.4074);
+          void readWeather(lat, lon, { mode: 'refresh' }).catch(() => {});
+        } catch (error) {
+          // 读设置失败：这一轮跳过，绝不把定时器搞挂。
+          // 但也别把编程错误（比如漏了 import）吞成静默——v1.1.10 就被这个空 catch 骗过一次：
+          // 定时器"在跑"，永远不会取数，直到真机盯了 90 秒才发现。
+          try {
+            ctx.logger?.warn?.(`[lifehud] weather poll tick failed: ${error instanceof Error ? error.message : String(error)}`);
+          } catch { /* logging must not fail the timer */ }
+        }
+      }, period);
+      if (typeof timer.unref === 'function') timer.unref();
+      return () => clearInterval(timer);
+    }, 'lifehud: weather poll');
+  } catch (error) {
+    try {
+      ctx.logger?.warn?.(`[lifehud] weather poll timer not registered: ${error instanceof Error ? error.message : String(error)}`);
+    } catch { /* logging must not fail activation */ }
+  }
+
   // 自采集（v1.1.1）：本机 PowerShell 采样前台窗口 + 空闲状态，把合并后的事件写进
   // <dataDir>/capture.db。启动失败只进诊断，绝不影响页面本身起不来。
   //
@@ -243,7 +278,7 @@ function applyInner(ctx, config) {
         try {
           force = new URL(String(req.url ?? ''), 'http://127.0.0.1').searchParams.get('force') === '1';
         } catch { /* 非法 URL 就当普通请求 */ }
-        buildHud(config, { isRunning }, { force })
+        buildHud(config, { isRunning }, { mode: force ? 'refresh' : 'cached' })
           // 倒计时随 /hud 一起下发（页面开着时卡片能立刻拿到权威状态）；
           // 它自己的增删改走 POST /lifehud/api/countdown。
           .then((payload) => sendJson(res, 200, { ...payload, countdown: countdownStatus() }))
@@ -402,7 +437,8 @@ export {
   countdownCancel, disposeCountdown, setCountdownNotifier, shiftCountdownForTest,
   tickCountdownForTest, resetCountdownForTest, COUNTDOWN_MAX_MS,
 } from './lib/countdown.js';
-export { buildHud, readWeather, clearWeatherCache, weatherStatus, setWeatherRetryDelayForTest } from './lib/hud.js';
+export { buildHud, readWeather, clearWeatherCache, weatherStatus } from './lib/hud.js';
+export { createWeatherSource, WEATHER_TTL_MS, WEATHER_TIMEOUT_MS, WEATHER_FAIL_COOLDOWN_MS, WEATHER_RETRY_MS } from './lib/weather.js';
 export {
   parseVersion, compareVersion, summarizeUpdate, readUpdate, UPDATE_REASON_CODES,
 } from './lib/update.js';
